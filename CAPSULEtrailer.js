@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.6.0';
+    var VERSION = '2.7.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v8';
+    var CACHE_KEY = 'capsule_trailer_cache_v9';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -1400,6 +1400,11 @@
                 var ended = false;
                 var initTimer = null;
                 var loaderFallbackTimer = null;
+                var clockTimer = null;
+                var clockStamp = 0;
+                var clockBase = 0;
+                var lastRemoteClock = 0;
+                var metadataRequest = new Lampa.Reguest();
 
                 function setLoader(status, text) {
                     if (text) loader.find('.capsule-kinopoisk-loader__text').text(text);
@@ -1409,6 +1414,187 @@
                 function hideLoader() {
                     clearTimeout(loaderFallbackTimer);
                     setLoader(false);
+                }
+
+                function stopClock() {
+                    clearTimeout(clockTimer);
+                    clockTimer = null;
+                }
+
+                function startClock() {
+                    stopClock();
+                    if (paused || ended || !duration) return;
+
+                    clockBase = current;
+                    clockStamp = Date.now();
+
+                    function tick() {
+                        if (paused || ended || !duration) return;
+
+                        var now = Date.now();
+
+                        if (!lastRemoteClock || now - lastRemoteClock > 1200) {
+                            current = Math.min(duration, clockBase + (now - clockStamp) / 1000);
+                        }
+                        else {
+                            clockBase = current;
+                            clockStamp = now;
+                        }
+
+                        listener.send('timeupdate');
+
+                        if (duration > 0 && current >= duration - 0.15) {
+                            sendEnded();
+                            return;
+                        }
+
+                        clockTimer = setTimeout(tick, 500);
+                    }
+
+                    clockTimer = setTimeout(tick, 500);
+                }
+
+                function applyDuration(value) {
+                    var next = Number(value) || 0;
+                    if (next < 5 || next > 1800) return false;
+
+                    duration = next;
+                    if (current > duration) current = duration;
+
+                    listener.send('timeupdate');
+                    if (!paused && !ended) startClock();
+
+                    return true;
+                }
+
+                function decodeRepeated(value) {
+                    value = String(value || '').replace(/&amp;/gi, '&').replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
+
+                    for (var i = 0; i < 3; i++) {
+                        try {
+                            var decoded = decodeURIComponent(value);
+                            if (decoded === value) break;
+                            value = decoded;
+                        }
+                        catch (e) {
+                            break;
+                        }
+                    }
+
+                    return value;
+                }
+
+                function absoluteUrl(base, link) {
+                    link = decodeRepeated(link);
+                    if (/^https?:\/\//i.test(link)) return link;
+                    if (/^\/\//.test(link)) return (base.indexOf('https://') === 0 ? 'https:' : 'http:') + link;
+
+                    var origin = (String(base || '').match(/^(https?:\/\/[^\/]+)/i) || [])[1] || '';
+                    if (link.charAt(0) === '/') return origin + link;
+
+                    var clean = String(base || '').replace(/[?#].*$/, '');
+                    var slash = clean.lastIndexOf('/');
+                    var dir = slash >= 0 ? clean.slice(0, slash + 1) : clean + '/';
+
+                    return dir + link;
+                }
+
+                function playlistDuration(text) {
+                    var total = 0;
+                    var match;
+                    var regex = /#EXTINF:([0-9.]+)/gi;
+
+                    while ((match = regex.exec(String(text || '')))) {
+                        total += parseFloat(match[1]) || 0;
+                    }
+
+                    return total;
+                }
+
+                function firstVariantUrl(text, base) {
+                    var lines = String(text || '').replace(/\r/g, '').split('\n');
+
+                    for (var i = 0; i < lines.length; i++) {
+                        if (lines[i].indexOf('#EXT-X-STREAM-INF') !== 0) continue;
+
+                        for (var j = i + 1; j < lines.length; j++) {
+                            var candidate = $.trim(lines[j] || '');
+                            if (!candidate) continue;
+                            if (candidate.charAt(0) === '#') continue;
+                            return absoluteUrl(base, candidate);
+                        }
+                    }
+
+                    return '';
+                }
+
+                function extractWidgetHls(html) {
+                    html = String(html || '');
+                    var match = html.match(/[?&]mq_url=([^&"'<>\s]+)/i);
+
+                    if (!match) match = html.match(/["']mq_url["']\s*[:=]\s*["']([^"']+)/i);
+                    if (!match) match = html.match(/(https?(?:%3A|:)\/?\/?[^"'<>\s]+?\.m3u8[^"'<>\s]*)/i);
+
+                    if (!match) return '';
+
+                    var value = decodeRepeated(match[1] || match[0]);
+
+                    if (value.indexOf('http') > 0) value = value.slice(value.indexOf('http'));
+                    return /^https?:\/\//i.test(value) ? value : '';
+                }
+
+                function requestText(url, callback) {
+                    metadataRequest.native(url, function (data) {
+                        callback(null, String(data || ''));
+                    }, function () {
+                        callback(new Error('request'));
+                    }, false, {
+                        dataType: 'text',
+                        timeout: 6000,
+                        headers: playbackHeaders('kinopoisk')
+                    });
+                }
+
+                function probeDuration() {
+                    var cache = window.capsule_trailer_kp_duration_cache = window.capsule_trailer_kp_duration_cache || {};
+                    var cacheKey = (String(streamUrl || '').match(/\/trailer\/(\d+)/i) || [])[1] || String(streamUrl || '').split('?')[0];
+
+                    if (cache[cacheKey] && applyDuration(cache[cacheKey])) return;
+
+                    requestText(streamUrl, function (error, html) {
+                        if (error || !html) return;
+
+                        var hls = extractWidgetHls(html);
+
+                        if (!hls) {
+                            var durationMatch = html.match(/["'](?:videoDuration|duration)["']\s*[:=]\s*["']?([0-9.]+)/i);
+                            if (durationMatch && applyDuration(durationMatch[1])) cache[cacheKey] = duration;
+                            return;
+                        }
+
+                        requestText(hls, function (playlistError, playlist) {
+                            if (playlistError || !playlist) return;
+
+                            var total = playlistDuration(playlist);
+
+                            if (total > 0) {
+                                if (applyDuration(total)) cache[cacheKey] = duration;
+                                return;
+                            }
+
+                            var variant = firstVariantUrl(playlist, hls);
+                            if (!variant) return;
+
+                            requestText(variant, function (variantError, mediaPlaylist) {
+                                if (variantError || !mediaPlaylist) return;
+
+                                var mediaDuration = playlistDuration(mediaPlaylist);
+                                if (mediaDuration > 0 && applyDuration(mediaDuration)) {
+                                    cache[cacheKey] = duration;
+                                }
+                            });
+                        });
+                    });
                 }
 
                 function post(method, data) {
@@ -1432,6 +1618,7 @@
                     if (ended) return;
                     ended = true;
                     paused = true;
+                    stopClock();
                     listener.send('ended');
                 }
 
@@ -1462,9 +1649,12 @@
 
                     if (typeof eventTime !== 'undefined' && isFinite(Number(eventTime))) {
                         current = Math.max(0, Number(eventTime) || 0);
+                        lastRemoteClock = Date.now();
+                        clockBase = current;
+                        clockStamp = lastRemoteClock;
                     }
                     if (typeof eventDuration !== 'undefined' && Number(eventDuration) > 0) {
-                        duration = Number(eventDuration);
+                        applyDuration(eventDuration);
                     }
 
                     if (type === 'inited' || type === 'ready' || type === 'player:ready') {
@@ -1488,6 +1678,7 @@
                         ended = false;
                         paused = false;
                         hideLoader();
+                        startClock();
                         listener.send('playing');
                         listener.send('timeupdate');
                         return;
@@ -1495,6 +1686,7 @@
 
                     if (type === 'paused' || type === 'pause') {
                         paused = true;
+                        stopClock();
                         listener.send('pause');
                         listener.send('timeupdate');
                         return;
@@ -1514,13 +1706,17 @@
 
                     if (type === 'bufferingstarted' || type === 'buffering') {
                         setLoader(true, 'Буферизация трейлера…');
+                        stopClock();
                         listener.send('waiting');
                         return;
                     }
 
                     if (type === 'bufferingended') {
                         hideLoader();
-                        if (!paused) listener.send('playing');
+                        if (!paused) {
+                            startClock();
+                            listener.send('playing');
+                        }
                         return;
                     }
 
@@ -1561,7 +1757,7 @@
                         setLoader(true, 'Запускаем трейлер…');
                         clearTimeout(loaderFallbackTimer);
                         loaderFallbackTimer = setTimeout(function () {
-                            hideLoader();
+                            setLoader(true, 'Кинопоиск всё ещё загружает трейлер…');
                         }, 4500);
 
                         post('setVolume', { volume: muted ? 0 : volume });
@@ -1569,6 +1765,7 @@
                         if (wantedPlay) {
                             paused = false;
                             post('play');
+                            startClock();
                             listener.send('playing');
                         }
                     };
@@ -1585,6 +1782,7 @@
                         if (wantedPlay) {
                             paused = false;
                             post('play');
+                            startClock();
                             listener.send('playing');
                         }
                     }, 2500);
@@ -1600,8 +1798,12 @@
                     set: function (value) {
                         current = Math.max(0, Number(value) || 0);
                         if (duration > 0) current = Math.min(current, duration);
+                        lastRemoteClock = Date.now();
+                        clockBase = current;
+                        clockStamp = lastRemoteClock;
                         post('seek', { time: current });
                         listener.send('timeupdate');
+                        if (!paused && !ended) startClock();
                     },
                     get: function () { return current; }
                 });
@@ -1649,18 +1851,21 @@
                         return;
                     }
                     createFrame();
+                    probeDuration();
                 };
                 video.play = function () {
                     wantedPlay = true;
                     if (ready) {
                         paused = false;
                         post('play');
+                        startClock();
                         listener.send('playing');
                     }
                 };
                 video.pause = function () {
                     wantedPlay = false;
                     paused = true;
+                    stopClock();
                     if (ready) post('pause');
                 };
                 video.resize = function () {};
@@ -1668,6 +1873,8 @@
                 video.destroy = function () {
                     clearTimeout(initTimer);
                     clearTimeout(loaderFallbackTimer);
+                    stopClock();
+                    try { metadataRequest.clear(); } catch (e0) {}
                     window.removeEventListener('message', onMessage);
                     try { if (frame && frame.parentNode) frame.parentNode.removeChild(frame); } catch (e) {}
                     frame = null;
@@ -1813,7 +2020,7 @@
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box}' +
             '.capsule-kinopoisk-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
             '.capsule-kinopoisk-player iframe{position:absolute;top:0;right:0;bottom:0;left:0;z-index:1}' +
-            '.capsule-kinopoisk-loader{position:absolute;top:0;right:0;bottom:0;left:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;pointer-events:none;transition:opacity .16s ease}' +
+            '.capsule-kinopoisk-loader{position:absolute;top:0;right:0;bottom:0;left:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.42);pointer-events:none;transition:opacity .16s ease}' +
             '.capsule-kinopoisk-loader.hide{opacity:0;visibility:hidden}' +
             '.capsule-kinopoisk-loader__spinner{width:2.8em;height:2.8em;border:.22em solid rgba(255,255,255,.22);border-top-color:#fff;border-radius:50%;animation:capsule-kinopoisk-spin .8s linear infinite}' +
             '.capsule-kinopoisk-loader__text{font-size:1em;margin-top:1em;opacity:.72}' +
