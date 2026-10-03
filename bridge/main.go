@@ -291,4 +291,149 @@ func (b *bridge) searchVK(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if status < 200 || status >= 300 {
-		writeJSON(w, http.StatusBadGate
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "vk-search-status", "status": status})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+func (b *bridge) resolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close()
+	var req resolveRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad-json"})
+		return
+	}
+	req.Provider = strings.ToLower(strings.TrimSpace(req.Provider))
+	req.ID = strings.TrimSpace(req.ID)
+	if req.Quality < 0 || req.Quality > 4320 {
+		req.Quality = 0
+	}
+
+	var st stream
+	var headers http.Header
+	var err error
+
+	switch req.Provider {
+	case "ok":
+		st, headers, err = b.resolveOK(r.Context(), req.ID, req.Quality)
+	case "vk":
+		st, headers, err = b.resolveVK(r.Context(), req.ID, req.Quality)
+	case "dzen":
+		st, headers, err = b.resolveDzen(r.Context(), req.ID, req.Quality)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown-provider"})
+		return
+	}
+	if err != nil {
+		log.Printf("resolve %s %s: %v", req.Provider, req.ID, err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "resolve-failed", "provider": req.Provider, "detail": err.Error()})
+		return
+	}
+
+	token, err := randomToken()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "token"})
+		return
+	}
+	b.mediaMu.Lock()
+	b.media[token] = mediaEntry{URL: st.URL, Headers: headers.Clone(), Provider: req.Provider, CreatedAt: time.Now()}
+	b.mediaMu.Unlock()
+
+	mediaURL := "http://" + defaultAddr + "/v1/media/" + token
+	writeJSON(w, http.StatusOK, resolveResponse{URL: mediaURL, Quality: st.Quality, Provider: req.Provider})
+}
+
+func (b *bridge) mediaProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := strings.TrimPrefix(r.URL.Path, "/v1/media/")
+	if token == "" || strings.Contains(token, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	b.mediaMu.RLock()
+	entry, ok := b.media[token]
+	b.mediaMu.RUnlock()
+	if !ok || time.Since(entry.CreatedAt) > mediaTTL {
+		http.Error(w, "media token expired", http.StatusGone)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, entry.URL, nil)
+	if err != nil {
+		http.Error(w, "bad upstream", http.StatusBadGateway)
+		return
+	}
+	for key, values := range entry.Headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	if v := r.Header.Get("Range"); v != "" {
+		req.Header.Set("Range", v)
+	}
+	if v := r.Header.Get("If-Range"); v != "" {
+		req.Header.Set("If-Range", v)
+	}
+
+	client := *b.mediaClient
+	client.CheckRedirect = func(redir *http.Request, via []*http.Request) error {
+		if len(via) >= 8 {
+			return errors.New("too many redirects")
+		}
+		for key, values := range entry.Headers {
+			redir.Header.Del(key)
+			for _, value := range values {
+				redir.Header.Add(key, value)
+			}
+		}
+		redir.Header.Set("Accept-Encoding", "identity")
+		if v := req.Header.Get("Range"); v != "" {
+			redir.Header.Set("Range", v)
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("media %s: %v", entry.Provider, err)
+		http.Error(w, "upstream media error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for _, key := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Cache-Control"} {
+		if value := resp.Header.Get(key); value != "" {
+			w.Header().Set(key, value)
+		}
+	}
+	if w.Header().Get("Accept-Ranges") == "" {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	w.WriteHeader(resp.StatusCode)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (b *bridge) resolveOK(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
+	if id == "" || !regexp.MustCompile(`^-?\d+$`).MatchString(id) {
+		return stream{}, nil, errors.New("invalid OK id")
+	}
+
+	form := url.Values{"mid": {id}}
+	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://www.ok.ru/dk?cmd=videoPlayerMetadata", strings.NewReader(form.Encode()), map[string]string{
+		"Accept":       "application/json,text/plain,*/*",
+		"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
+			"O
