@@ -20,7 +20,7 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.14.0';
+    var VERSION = '3.15.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
     var CACHE_KEY = 'capsule_trailer_cache_v16';
@@ -1998,7 +1998,7 @@
         var self = this;
         var movie = object.movie || {};
         var context = { movie: movie, videos: object.videos || { results: [] } };
-        var scroll = new Lampa.Scroll({ mask: true, over: true, step: 280 });
+        var scroll = new Lampa.Scroll({ mask: true, over: true, nopadding: true, step: 280 });
         var html = scroll.render();
         var content = $('<div class="capsule-trailer"></div>');
         html.addClass('capsule-trailer-scroll');
