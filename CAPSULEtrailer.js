@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.20.0';
+    var VERSION = '3.21.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v20';
+    var CACHE_KEY = 'capsule_trailer_cache_v21';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -32,6 +32,8 @@
     var AUTO_SETTLE_MS = 420;
     var AUTO_SEARCH_MAX_MS = 2600;
     var jsonpSerial = 0;
+    var BRIDGE_ORIGIN = 'http://127.0.0.1:19876';
+    var bridgeLastFailure = 0;
 
     var ICON = '' +
         '<svg width="42" height="42" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -765,6 +767,115 @@
         };
     }
 
+    function bridgeFailure(code) {
+        var error = new Error(code || 'capsule-bridge');
+        error.capsuleBridge = true;
+        bridgeLastFailure = Date.now();
+        return error;
+    }
+
+    function bridgeRequest(path, options, done) {
+        options = options || {};
+        var xhr = null;
+        var finished = false;
+        var timer = null;
+
+        function finish(error, data) {
+            if (finished) return;
+            finished = true;
+            if (timer) clearTimeout(timer);
+            done(error, data);
+        }
+
+        try {
+            xhr = new XMLHttpRequest();
+            xhr.open(options.method || 'GET', BRIDGE_ORIGIN + path, true);
+            xhr.timeout = options.timeout || 9000;
+            if (options.method === 'POST') xhr.setRequestHeader('Content-Type', 'application/json; charset=UTF-8');
+
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4 || finished) return;
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    finish(bridgeFailure('capsule-bridge-http-' + xhr.status));
+                    return;
+                }
+
+                var data = xhr.responseText;
+                if ((options.dataType || 'json') === 'json') {
+                    try { data = JSON.parse(data); }
+                    catch (e) {
+                        finish(bridgeFailure('capsule-bridge-json'));
+                        return;
+                    }
+                }
+                finish(null, data);
+            };
+            xhr.onerror = function () { finish(bridgeFailure('capsule-bridge-network')); };
+            xhr.ontimeout = function () { finish(bridgeFailure('capsule-bridge-timeout')); };
+            xhr.send(options.body || null);
+        }
+        catch (e) {
+            finish(bridgeFailure('capsule-bridge-unavailable'));
+        }
+
+        timer = setTimeout(function () {
+            if (finished) return;
+            try { if (xhr) xhr.abort(); } catch (e) {}
+            finish(bridgeFailure('capsule-bridge-timeout'));
+        }, (options.timeout || 9000) + 500);
+
+        return function () {
+            finished = true;
+            if (timer) clearTimeout(timer);
+            try { if (xhr) xhr.abort(); } catch (e) {}
+        };
+    }
+
+    function bridgeResolve(provider, item, context, done) {
+        var id = '';
+        if (provider === 'ok') id = String(item && item.okId || '');
+        else if (provider === 'vk') id = String(item && item.vkId || '');
+        else if (provider === 'dzen') id = String(item && item.dzenId || '');
+
+        if (!id) {
+            done(bridgeFailure('capsule-bridge-id'));
+            return function () {};
+        }
+
+        var payload = JSON.stringify({
+            provider: provider,
+            id: id,
+            quality: preferredQuality()
+        });
+
+        return bridgeRequest('/v1/resolve', {
+            method: 'POST',
+            dataType: 'json',
+            timeout: 12000,
+            body: payload
+        }, function (error, data) {
+            if (error || !data) {
+                done(error || bridgeFailure('capsule-bridge-resolve'));
+                return;
+            }
+
+            var media = String(data.url || '');
+            if (media.indexOf(BRIDGE_ORIGIN + '/v1/media/') !== 0) {
+                done(bridgeFailure('capsule-bridge-media'));
+                return;
+            }
+
+            done(null, {
+                url: capsuleMediaUrl(media, 'direct'),
+                title: item.title,
+                card: context.movie,
+                capsule_trailer: true,
+                capsule_source: provider + '-bridge',
+                headers: null
+            });
+        });
+    }
+
     function nativeRequest(url, timeout, done, headers) {
         return requestData(url, 'json', timeout, done, headers);
     }
@@ -1069,6 +1180,8 @@
     }
 
     function resolveOk(item, context, done) {
+        if (isBrowserHttpTransport()) return bridgeResolve('ok', item, context, done);
+
         var id = item.okId;
         if (!id) {
             done(new Error('ok-id'));
@@ -1207,7 +1320,7 @@
                 if (index >= queries.length) return finish();
                 var query = queries[index++];
                 var url = 'https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=' + encodeURIComponent(query) + '&st.m=SEARCH';
-                cancelCurrent = textRequest(url, 7000, function (error, text) {
+                var onResult = function (error, text) {
                     if (!error && text) {
                         var items = parseOkSearch(text, movie);
                         for (var i = 0; i < items.length; i++) {
@@ -1220,7 +1333,16 @@
 
                     if (index === 1 && all.length >= 2) return finish();
                     next();
-                });
+                };
+
+                if (isBrowserHttpTransport()) {
+                    cancelCurrent = bridgeRequest('/v1/search/ok?q=' + encodeURIComponent(query), {
+                        method: 'GET',
+                        dataType: 'text',
+                        timeout: 7500
+                    }, onResult);
+                }
+                else cancelCurrent = textRequest(url, 7000, onResult);
             }
 
             next();
@@ -1477,6 +1599,15 @@
             for (var i = 0; i < streams.length; i++) push(streams[i], 0);
         }
 
+        var mp4 = video.mp4Streams;
+        if (Object.prototype.toString.call(mp4) === '[object Array]') {
+            var mp4QualityMap = { ultra:2160, quad:1440, fullhd:1080, full:1080, hd:720, sd:480, low:360, lowest:240, mobile:144 };
+            for (var mi = 0; mi < mp4.length; mi++) {
+                var mp4Row = mp4[mi] || {};
+                push(mp4Row.url, parseInt(mp4Row.height, 10) || mp4QualityMap[String(mp4Row.type || '').toLowerCase()] || qualityNumber(mp4Row.type));
+            }
+        }
+
         var one = video.oneVideoStreams;
         if (Object.prototype.toString.call(one) === '[object Array]') {
             var qualityMap = { ultra:2160, quad:1440, fullhd:1080, full:1080, hd:720, sd:480, low:360, lowest:240, mobile:144 };
@@ -1547,6 +1678,8 @@
     }
 
     function resolveDzen(item, context, done) {
+        if (isBrowserHttpTransport()) return bridgeResolve('dzen', item, context, done);
+
         var immediate = dzenStreamGroups(item.dzenVideo || {});
         if (immediate.direct.length || immediate.hls.length || immediate.dash.length) {
             finishDzenResolve(item.dzenVideo, item, context, done);
@@ -1583,7 +1716,7 @@
                 '&clid=1400&type_filter=video&lang=ru';
             var htmlUrl = 'https://dzen.ru/search?query=' + encodeURIComponent(query) + '&type_filter=video';
             var cancelled = false;
-            var cancelCurrent = nativeRequest(jsonUrl, 5500, function (error, data) {
+            var searchDone = function (error, data) {
                 if (cancelled) return;
                 var items = !error ? normalizeDzenSearch(data, movie) : [];
 
@@ -1592,12 +1725,33 @@
                     return;
                 }
 
-                cancelCurrent = textRequest(htmlUrl, 5500, function (htmlError, text) {
-                    if (cancelled) return;
-                    if (htmlError || !text) return done(htmlError || error || new Error('dzen-search'), []);
-                    done(null, normalizeDzenHtml(text, movie));
-                }, playbackHeaders('dzen'));
-            });
+                if (isBrowserHttpTransport()) {
+                    cancelCurrent = bridgeRequest('/v1/search/dzen-html?q=' + encodeURIComponent(query), {
+                        method: 'GET',
+                        dataType: 'text',
+                        timeout: 6500
+                    }, function (htmlError, text) {
+                        if (cancelled) return;
+                        if (htmlError || !text) return done(htmlError || error || new Error('dzen-search'), []);
+                        done(null, normalizeDzenHtml(text, movie));
+                    });
+                }
+                else {
+                    cancelCurrent = textRequest(htmlUrl, 5500, function (htmlError, text) {
+                        if (cancelled) return;
+                        if (htmlError || !text) return done(htmlError || error || new Error('dzen-search'), []);
+                        done(null, normalizeDzenHtml(text, movie));
+                    }, playbackHeaders('dzen'));
+                }
+            };
+
+            var cancelCurrent = isBrowserHttpTransport() ?
+                bridgeRequest('/v1/search/dzen?q=' + encodeURIComponent(query), {
+                    method: 'GET',
+                    dataType: 'json',
+                    timeout: 6500
+                }, searchDone) :
+                nativeRequest(jsonUrl, 5500, searchDone);
 
             return function () {
                 cancelled = true;
@@ -1998,7 +2152,7 @@
     }
 
     function resolveVk(item, context, done) {
-        if (isBrowserHttpTransport()) return resolveVkPublic(item, context, done);
+        if (isBrowserHttpTransport()) return bridgeResolve('vk', item, context, done);
 
         var cancelled = false;
         var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
@@ -2054,11 +2208,14 @@
             var query = [title, year, 'трейлер'].join(' ').replace(/\s+/g, ' ');
 
             if (isBrowserHttpTransport()) {
-                var publicUrl = 'https://vk.com/video?q=' + encodeURIComponent(query);
-                return textRequest(publicUrl, 6500, function (error, text) {
-                    if (error || !text) return done(error || new Error('vk-public-search'), []);
-                    var items = normalizeVkPublicSearch(text, movie);
-                    if (!items.length) return done(new Error('vk-public-search-empty'), []);
+                return bridgeRequest('/v1/search/vk?q=' + encodeURIComponent(query), {
+                    method: 'GET',
+                    dataType: 'json',
+                    timeout: 7500
+                }, function (error, data) {
+                    if (error || !data || data.error) return done(error || new Error('vk-search'), []);
+                    var items = normalizeVkSearch(data, movie);
+                    if (!items.length) return done(new Error('vk-search-empty'), []);
                     done(null, items);
                 });
             }
@@ -3003,8 +3160,11 @@
                 }
             }
             else {
-                status.text(failures.length ? 'Источники сейчас недоступны' : 'Трейлеры не найдены');
-                resultRoot.append('<div class="capsule-trailer__empty">Для этой карточки подходящих трейлеров не найдено.</div>');
+                var bridgeFailedRecently = isBrowserHttpTransport() && failures.length && bridgeLastFailure && Date.now() - bridgeLastFailure < 30000;
+                status.text(bridgeFailedRecently ? 'CAPSULE Bridge не запущен' : (failures.length ? 'Источники сейчас недоступны' : 'Трейлеры не найдены'));
+                resultRoot.append('<div class="capsule-trailer__empty">' +
+                    (bridgeFailedRecently ? 'На ПК запусти CAPSULE Trailer Bridge и повтори поиск.' : 'Для этой карточки подходящих трейлеров не найдено.') +
+                    '</div>');
                 addRetry();
             }
             self.activity.toggle();
@@ -3026,7 +3186,8 @@
                 if (!alive) return;
                 self.activity.loader(false);
                 if (error || !data || !data.url) {
-                    Lampa.Noty.show('Видео недоступно');
+                    if (error && error.capsuleBridge) Lampa.Noty.show('CAPSULE Bridge не отвечает');
+                    else Lampa.Noty.show('Видео недоступно');
                     return;
                 }
                 try {
