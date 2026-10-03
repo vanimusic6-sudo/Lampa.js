@@ -997,7 +997,8 @@
             return function () {
                 cancelled = true;
                 if (cancelCurrent) cancelCurrent();
-            };        },
+            };
+        },
         resolve: resolveYandex
     };
 
@@ -1996,7 +1997,8 @@
             totalResults = 0;
             failures = [];
             resultSeen = {};
-            last = null;            resultRoot.empty();
+            last = null;
+            resultRoot.empty();
         }
 
         function retry() {
