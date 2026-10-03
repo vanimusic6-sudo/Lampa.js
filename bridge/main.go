@@ -435,5 +435,5 @@ func (b *bridge) resolveOK(ctx context.Context, id string, preferred int) (strea
 	form := url.Values{"mid": {id}}
 	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://www.ok.ru/dk?cmd=videoPlayerMetadata", strings.NewReader(form.Encode()), map[string]string{
 		"Accept":       "application/json,text/plain,*/*",
-		"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
-			"O
+		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+		"O
