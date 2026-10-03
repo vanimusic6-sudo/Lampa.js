@@ -20,7 +20,7 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.10.0';
+    var VERSION = '3.11.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
     var CACHE_KEY = 'capsule_trailer_cache_v15';
@@ -1937,11 +1937,22 @@
             '.capsule-trailer__skeleton-line.small{width:36%;opacity:.72}' +
 
             '.view--capsule-trailer svg{width:1.58em;height:1.58em}' +
+
+            '.capsule-trailer--compact .capsule-trailer__hero{height:auto;min-height:0;overflow:visible;background:#17181a;padding:1.25em 2.2em .72em;box-sizing:border-box}' +
+            '.capsule-trailer--compact .capsule-trailer__backdrop,.capsule-trailer--compact .capsule-trailer__hero:before,.capsule-trailer--compact .capsule-trailer__hero:after{display:none}' +
+            '.capsule-trailer--compact .capsule-trailer__hero-inner{position:relative;left:auto;right:auto;bottom:auto;max-width:75em;margin:0 auto}' +
+            '.capsule-trailer--compact .capsule-trailer__title{font-size:1.72em;max-width:none;text-shadow:none}' +
+            '.capsule-trailer--compact .capsule-trailer__hero-meta{margin-top:.42em}' +
+            '.capsule-trailer--compact .capsule-trailer__panel{margin-top:0}' +
+
             'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:14em}' +
             'body.true--mobile.orientation--landscape .capsule-trailer__results{padding-right:12em}' +
 
             '@media(max-width:700px){' +
                 '.capsule-trailer__hero{height:20.2em}' +
+                '.capsule-trailer--compact .capsule-trailer__hero{height:auto;padding:.85em 1.15em .55em}' +
+                '.capsule-trailer--compact .capsule-trailer__title{font-size:1.42em}' +
+                '.capsule-trailer--compact .capsule-trailer__hero-meta{font-size:.76em;margin-top:.34em}' +
                 '.capsule-trailer__backdrop{left:50%;top:0;bottom:0;width:138%;max-width:none!important;height:100%;object-position:50% 44%;transform:translateX(-50%);transform-origin:50% 100%}' +
                 '.capsule-trailer__hero:before{top:0;height:7.2em;background:linear-gradient(0deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.1) 23%,rgba(23,24,26,.38) 48%,rgba(23,24,26,.76) 73%,#17181a 100%),linear-gradient(90deg,rgba(23,24,26,.16) 0%,rgba(23,24,26,.012) 56%,rgba(23,24,26,.05) 100%)}' +
                 '.capsule-trailer__hero:after{top:38%;background:linear-gradient(180deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.03) 8%,rgba(23,24,26,.13) 22%,rgba(23,24,26,.38) 42%,rgba(23,24,26,.72) 63%,rgba(23,24,26,.92) 79%,rgba(23,24,26,.992) 92%,#17181a 100%)}' +
@@ -2026,6 +2037,21 @@
         var autoStarted = false;
         var activeFilter = 'all';
         var availableFilters = [];
+        var layoutBound = false;
+
+        function compactLayoutMode() {
+            try {
+                if (Lampa.Platform && typeof Lampa.Platform.screen === 'function' && Lampa.Platform.screen('tv')) return true;
+            }
+            catch (e) {}
+
+            return window.innerWidth > window.innerHeight;
+        }
+
+        function updateLayoutMode() {
+            content.toggleClass('capsule-trailer--compact', compactLayoutMode());
+            try { scroll.height(); } catch (e) {}
+        }
 
         function header() {
             var backdrop = backdropUrl(movie);
@@ -2456,6 +2482,14 @@
             panel.append(resultRoot);
             content.append(panel);
             scroll.append(content);
+
+            updateLayoutMode();
+            if (!layoutBound) {
+                window.addEventListener('resize', updateLayoutMode);
+                window.addEventListener('orientationchange', updateLayoutMode);
+                layoutBound = true;
+            }
+
             try { scroll.height(); } catch (e) {}
             status.text('Ищем лучшие варианты…');
             runProviders();
@@ -2512,6 +2546,13 @@
         this.destroy = function () {
             alive = false;
             started = false;
+
+            if (layoutBound) {
+                window.removeEventListener('resize', updateLayoutMode);
+                window.removeEventListener('orientationchange', updateLayoutMode);
+                layoutBound = false;
+            }
+
             clearTimeout(autoTimer);
             autoTimer = null;
             if (resolvingCancel) {
