@@ -619,7 +619,7 @@
                 qualityHint: '',
                 year: year,
                 kind: trailerKind(raw.title),
-                official: /official/i.test(String(raw.title || '')) || raw.uploaderVerified === true,
+                official: /official|официальн/i.test(String(raw.title || '')),
                 videoId: id,
                 url: 'https://www.youtube.com/watch?v=' + id,
                 transportScore: 105,
@@ -732,6 +732,10 @@
             var nearby = before + after;
             var titleMatches = before.match(/"title":"((?:\\.|[^"\\])*)"/g) || [];
             var titleRaw = titleMatches.length ? titleMatches[titleMatches.length - 1].replace(/^"title":"|"$/g, '') : '';
+            if (!titleRaw) {
+                var afterTitle = after.match(/"title":"((?:\\.|[^"\\])*)"/);
+                titleRaw = afterTitle ? afterTitle[1] : '';
+            }
             var title = decodeJsonString(titleRaw);
             var yearMatch = nearby.match(/"releaseYear":(\d{4})/);
             var kpMatch = nearby.match(/"kpId":"?(\d+)"?/);
@@ -747,11 +751,11 @@
                     duration: 0,
                     thumbnail: imageUrl(movie),
                     author: '',
-                    language: 'ru',
+                    language: '',
                     qualityHint: '',
                     year: yearMatch ? yearMatch[1] : '',
                     kind: 'trailer',
-                    official: true,
+                    official: false,
                     yandexId: idMatch[1],
                     yandexPlayer: iframe,
                     kpId: kpMatch ? kpMatch[1] : '',
@@ -993,11 +997,11 @@
                 cursor = start + 1;
                 continue;
             }
-            var end = text.indexOf(quote, start + 1);
-            if (end < 0) break;
+            var end = text.indexOf(quote, start + 1);            if (end < 0) break;
             var decoded = decodeHtmlEntities(text.slice(start + 1, end));
             if (decoded.indexOf(String(id)) >= 0) {
-                try { return JSON.parse(decoded); } catch (e) { return null; }            }
+                try { return JSON.parse(decoded); } catch (e) { return null; }
+            }
             cursor = end + 1;
         }
         return null;
@@ -1082,6 +1086,7 @@
             }
             var movie = context.movie || {};
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+            var original = movie.original_title || movie.original_name || '';
             var year = yearOf(movie);
             var key = 'ok:' + movieKey(movie);
             var cached = cacheGet(key);
@@ -1089,14 +1094,53 @@
                 done(null, cached);
                 return function () {};
             }
-            var query = [title, year, 'трейлер'].join(' ');
-            var url = 'https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=' + encodeURIComponent(query) + '&st.m=SEARCH';
-            return textRequest(url, 7000, function (error, text) {
-                if (error || !text) return done(error || new Error('ok-search'), []);
-                var items = parseOkSearch(text, movie);
-                cachePut(key, items);
-                done(null, items);
-            });
+            var queries = [];
+            var all = [];
+            var seen = {};
+            var index = 0;
+            var cancelled = false;
+            var cancelCurrent = null;
+
+            function addQuery(value) {
+                value = String(value || '').replace(/^\s+|\s+$/g, '');
+                if (value && queries.indexOf(value) < 0) queries.push(value);
+            }
+
+            addQuery([title, year, 'трейлер'].join(' '));
+            if (original && cleanText(original) !== cleanText(title)) addQuery([original, year, 'trailer'].join(' '));
+
+            function finish() {
+                if (cancelled) return;
+                all.sort(function (a, b) { return b.score - a.score; });
+                all = all.slice(0, 6);
+                cachePut(key, all);
+                done(null, all);
+            }
+
+            function next() {
+                if (cancelled) return;
+                if (index >= queries.length) return finish();
+                var query = queries[index++];
+                var url = 'https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=' + encodeURIComponent(query) + '&st.m=SEARCH';
+                cancelCurrent = textRequest(url, 7000, function (error, text) {
+                    if (!error && text) {
+                        var items = parseOkSearch(text, movie);
+                        for (var i = 0; i < items.length; i++) {
+                            if (!seen[items[i].canonical]) {
+                                seen[items[i].canonical] = true;
+                                all.push(items[i]);
+                            }
+                        }
+                    }
+                    next();
+                });
+            }
+
+            next();
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
         },
         resolve: resolveOk
     };
@@ -1952,8 +1996,7 @@
             }
         });
 
-        Lampa.SettingsApi.addParam({
-            component: 'capsule_trailer_settings',
+        Lampa.SettingsApi.addParam({            component: 'capsule_trailer_settings',
             param: {
                 name: 'capsule_trailer_yandex',
                 type: 'trigger',
@@ -1996,6 +2039,7 @@
         if (!event || event.type !== 'complite' || !event.data || !event.data.movie || !event.object || !event.object.activity) return;
         var movie = event.data.movie;
         if (movie.adult) return;
+
         var render = event.object.activity.render();
         if (!render || !render.find) return;
         if (render.find('.view--capsule-trailer').length) return;
