@@ -26,110 +26,86 @@ import (
 )
 
 const (
-	bridgeVersion = "1.0.0"
-	defaultAddr   = "127.0.0.1:19876"
-	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-	mediaTTL      = 2 * time.Hour
+	version = "1.0.0"
+	addr = "127.0.0.1:19876"
+	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+	mediaTTL = 2 * time.Hour
 )
 
-var qualityOrder = map[string]int{
-	"mobile": 144, "lowest": 240, "low": 360, "sd": 480,
-	"hd": 720, "full": 1080, "fullhd": 1080, "quad": 1440, "ultra": 2160,
+var qualityMap = map[string]int{
+	"mobile":144, "lowest":240, "low":360, "sd":480, "hd":720,
+	"full":1080, "fullhd":1080, "quad":1440, "ultra":2160,
 }
 
-var okTypeHeight = map[string]int{"4": 144, "0": 240, "1": 360, "2": 480, "3": 720, "5": 1080, "6": 1440, "7": 2160}
+var vkIDRe = regexp.MustCompile("^-?[0-9]+_[0-9]+$")
 
-var (
-	reMP4Key      = regexp.MustCompile(`^(?:mp4_|url|cache)(\d{3,4})$`)
-	reVKVideoID   = regexp.MustCompile(`^-?\d+_\d+$`)
-	reOKDataProps = regexp.MustCompile(`(?is)<video-search-result\b[^>]*\bdata-props=(?:"([^"]+)"|'([^']+)')`)
-)
-
-type bridge struct {
-	client      *http.Client
-	mediaClient *http.Client
-
-	mediaMu sync.RWMutex
-	media   map[string]mediaEntry
-
-	vkMu      sync.Mutex
-	vkToken   string
-	vkExpires int64
+type stream struct {
+	URL string
+	Quality int
 }
 
 type mediaEntry struct {
-	URL       string
-	Headers   http.Header
-	Provider  string
-	CreatedAt time.Time
+	URL string
+	Headers http.Header
+	Provider string
+	Created time.Time
 }
 
-type resolveRequest struct {
-	Provider string `json:"provider"`
-	ID       string `json:"id"`
-	Embed    string `json:"embed,omitempty"`
-	Quality  int    `json:"quality,omitempty"`
-}
-
-type resolveResponse struct {
-	URL      string `json:"url"`
-	Quality  int    `json:"quality,omitempty"`
-	Provider string `json:"provider"`
-}
-
-type stream struct {
-	URL     string
-	Quality int
+type bridge struct {
+	client *http.Client
+	mediaClient *http.Client
+	mediaMu sync.RWMutex
+	media map[string]mediaEntry
+	vkMu sync.Mutex
+	vkToken string
+	vkExpires int64
 }
 
 func main() {
 	jar, _ := cookiejar.New(nil)
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 12 * time.Second,
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{Timeout:8*time.Second, KeepAlive:30*time.Second}).DialContext,
+		ForceAttemptHTTP2: true,
+		MaxIdleConns: 32,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout: 60*time.Second,
+		TLSHandshakeTimeout: 8*time.Second,
+		ResponseHeaderTimeout: 12*time.Second,
 	}
-
 	b := &bridge{
-		client:      &http.Client{Transport: transport, Jar: jar, Timeout: 18 * time.Second},
-		mediaClient: &http.Client{Transport: transport, Timeout: 0},
-		media:       make(map[string]mediaEntry),
+		client: &http.Client{Transport:tr, Jar:jar, Timeout:18*time.Second},
+		mediaClient: &http.Client{Transport:tr},
+		media: map[string]mediaEntry{},
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", b.withCORS(b.health))
-	mux.HandleFunc("/v1/search/ok", b.withCORS(b.searchOK))
-	mux.HandleFunc("/v1/search/dzen", b.withCORS(b.searchDzen))
-	mux.HandleFunc("/v1/search/dzen-html", b.withCORS(b.searchDzenHTML))
-	mux.HandleFunc("/v1/search/vk", b.withCORS(b.searchVK))
-	mux.HandleFunc("/v1/resolve", b.withCORS(b.resolve))
-	mux.HandleFunc("/v1/media/", b.withCORS(b.mediaProxy))
+	mux.HandleFunc("/health", b.cors(b.health))
+	mux.HandleFunc("/v1/search/ok", b.cors(b.searchOK))
+	mux.HandleFunc("/v1/search/dzen", b.cors(b.searchDzen))
+	mux.HandleFunc("/v1/search/dzen-html", b.cors(b.searchDzenHTML))
+	mux.HandleFunc("/v1/search/vk", b.cors(b.searchVK))
+	mux.HandleFunc("/v1/resolve", b.cors(b.resolve))
+	mux.HandleFunc("/v1/media/", b.cors(b.mediaProxy))
 
 	srv := &http.Server{
-		Addr:              defaultAddr,
-		Handler:           logRequests(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		Addr: addr,
+		Handler: logRequests(mux),
+		ReadHeaderTimeout: 5*time.Second,
+		IdleTimeout: 60*time.Second,
 	}
 
-	go b.cleanupLoop()
-
+	go b.cleanup()
 	go func() {
-		log.Printf("CAPSULE Trailer Bridge %s listening on http://%s", bridgeVersion, defaultAddr)
+		log.Printf("CAPSULE Trailer Bridge %s: http://%s", version, addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("listen: %v", err)
+			log.Fatal(err)
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	<-ch
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
@@ -137,14 +113,12 @@ func main() {
 
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health" {
-			log.Printf("%s %s", r.Method, r.URL.RequestURI())
-		}
+		if r.URL.Path != "/health" { log.Printf("%s %s", r.Method, r.URL.RequestURI()) }
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (b *bridge) withCORS(next http.HandlerFunc) http.HandlerFunc {
+func (b *bridge) cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
@@ -165,31 +139,22 @@ func (b *bridge) health(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": bridgeVersion})
+	writeJSON(w, http.StatusOK, map[string]any{"ok":true, "version":version})
 }
 
 func (b *bridge) searchOK(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "missing q", http.StatusBadRequest)
+	if r.Method != http.MethodGet || q == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-
-	target := "https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=" + url.QueryEscape(q) + "&st.m=SEARCH"
-	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
-		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
-		"Referer": "https://ok.ru/",
+	target := "https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq="+url.QueryEscape(q)+"&st.m=SEARCH"
+	body, status, err := b.fetch(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":"text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer":"https://ok.ru/",
 	})
-	if err != nil {
-		writeUpstreamError(w, "ok-search", err)
-		return
-	}
-	if status < 200 || status >= 300 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "ok-search-status", "status": status})
+	if err != nil || status < 200 || status >= 300 {
+		upstreamError(w, "ok-search", status, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -197,27 +162,18 @@ func (b *bridge) searchOK(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *bridge) searchDzen(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "missing q", http.StatusBadRequest)
+	if r.Method != http.MethodGet || q == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-
-	target := "https://dzen.ru/api/web/v1/zen-search?country_code=ru&forced_request_type=long_video_search&query=" + url.QueryEscape(q) + "&clid=1400&type_filter=video&lang=ru"
-	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
-		"Accept":  "application/json,text/plain,*/*",
-		"Referer": "https://dzen.ru/",
+	target := "https://dzen.ru/api/web/v1/zen-search?country_code=ru&forced_request_type=long_video_search&query="+url.QueryEscape(q)+"&clid=1400&type_filter=video&lang=ru"
+	body, status, err := b.fetch(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Referer":"https://dzen.ru/",
 	})
-	if err != nil {
-		writeUpstreamError(w, "dzen-search", err)
-		return
-	}
-	if status < 200 || status >= 300 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "dzen-search-status", "status": status})
+	if err != nil || status < 200 || status >= 300 {
+		upstreamError(w, "dzen-search", status, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -225,27 +181,18 @@ func (b *bridge) searchDzen(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *bridge) searchDzenHTML(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "missing q", http.StatusBadRequest)
+	if r.Method != http.MethodGet || q == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-
-	target := "https://dzen.ru/search?query=" + url.QueryEscape(q) + "&type_filter=video"
-	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
-		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
-		"Referer": "https://dzen.ru/",
+	target := "https://dzen.ru/search?query="+url.QueryEscape(q)+"&type_filter=video"
+	body, status, err := b.fetch(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":"text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer":"https://dzen.ru/",
 	})
-	if err != nil {
-		writeUpstreamError(w, "dzen-search-html", err)
-		return
-	}
-	if status < 200 || status >= 300 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "dzen-search-html-status", "status": status})
+	if err != nil || status < 200 || status >= 300 {
+		upstreamError(w, "dzen-search-html", status, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -253,49 +200,37 @@ func (b *bridge) searchDzenHTML(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *bridge) searchVK(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	if q == "" {
-		http.Error(w, "missing q", http.StatusBadRequest)
+	if r.Method != http.MethodGet || q == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	token, err := b.vkAnonymousToken(r.Context())
+	token, err := b.vkAnonymousToken(r.Context(), false)
 	if err != nil {
-		writeUpstreamError(w, "vk-token", err)
+		upstreamError(w, "vk-token", 0, err)
 		return
 	}
-
-	endpoint := "https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2?v=5.282&client_id=52461373&count=30&q=" + url.QueryEscape(q) + "&content_type=video&access_token=" + url.QueryEscape(token)
-	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, endpoint, nil, map[string]string{
-		"Accept":  "application/json,text/plain,*/*",
-		"Referer": "https://vkvideo.ru/",
-		"Origin":  "https://vkvideo.ru",
-	})
+	body, status, err := b.vkSearch(r.Context(), q, token)
 	if err == nil && vkErrorCode(body) == 5 {
-		b.vkMu.Lock()
-		b.vkToken, b.vkExpires = "", 0
-		b.vkMu.Unlock()
-		if refreshed, tokenErr := b.vkAnonymousToken(r.Context()); tokenErr == nil {
-			endpoint = "https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2?v=5.282&client_id=52461373&count=30&q=" + url.QueryEscape(q) + "&content_type=video&access_token=" + url.QueryEscape(refreshed)
-			body, status, err = b.fetchRaw(r.Context(), http.MethodGet, endpoint, nil, map[string]string{
-				"Accept": "application/json,text/plain,*/*", "Referer": "https://vkvideo.ru/", "Origin": "https://vkvideo.ru",
-			})
-		}
+		token, err = b.vkAnonymousToken(r.Context(), true)
+		if err == nil { body, status, err = b.vkSearch(r.Context(), q, token) }
 	}
-	if err != nil {
-		writeUpstreamError(w, "vk-search", err)
-		return
-	}
-	if status < 200 || status >= 300 {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "vk-search-status", "status": status})
+	if err != nil || status < 200 || status >= 300 {
+		upstreamError(w, "vk-search", status, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_, _ = w.Write(body)
+}
+
+func (b *bridge) vkSearch(ctx context.Context, q, token string) ([]byte, int, error) {
+	target := "https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2?v=5.282&client_id=52461373&count=30&q="+url.QueryEscape(q)+"&content_type=video&access_token="+url.QueryEscape(token)
+	return b.fetch(ctx, http.MethodGet, target, nil, map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Referer":"https://vkvideo.ru/",
+		"Origin":"https://vkvideo.ru",
+	})
 }
 
 func (b *bridge) resolve(w http.ResponseWriter, r *http.Request) {
@@ -304,49 +239,50 @@ func (b *bridge) resolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	var req resolveRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad-json"})
+	var req map[string]any
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error":"bad-json"})
 		return
 	}
-	req.Provider = strings.ToLower(strings.TrimSpace(req.Provider))
-	req.ID = strings.TrimSpace(req.ID)
-	if req.Quality < 0 || req.Quality > 4320 {
-		req.Quality = 0
-	}
+	provider := strings.ToLower(strings.TrimSpace(anyString(req["provider"])))
+	id := strings.TrimSpace(anyString(req["id"]))
+	quality := anyInt(req["quality"])
+	if quality < 0 || quality > 4320 { quality = 0 }
 
 	var st stream
 	var headers http.Header
 	var err error
-
-	switch req.Provider {
+	switch provider {
 	case "ok":
-		st, headers, err = b.resolveOK(r.Context(), req.ID, req.Quality)
+		st, headers, err = b.resolveOK(r.Context(), id, quality)
 	case "vk":
-		st, headers, err = b.resolveVK(r.Context(), req.ID, req.Quality)
+		st, headers, err = b.resolveVK(r.Context(), id, quality)
 	case "dzen":
-		st, headers, err = b.resolveDzen(r.Context(), req.ID, req.Quality)
+		st, headers, err = b.resolveDzen(r.Context(), id, quality)
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unknown-provider"})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error":"unknown-provider"})
 		return
 	}
-	if err != nil {
-		log.Printf("resolve %s %s: %v", req.Provider, req.ID, err)
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "resolve-failed", "provider": req.Provider, "detail": err.Error()})
+	if err != nil || st.URL == "" {
+		if err == nil { err = errors.New("no stream") }
+		upstreamError(w, "resolve-"+provider, 0, err)
 		return
 	}
 
 	token, err := randomToken()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "token"})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error":"token"})
 		return
 	}
 	b.mediaMu.Lock()
-	b.media[token] = mediaEntry{URL: st.URL, Headers: headers.Clone(), Provider: req.Provider, CreatedAt: time.Now()}
+	b.media[token] = mediaEntry{URL:st.URL, Headers:headers.Clone(), Provider:provider, Created:time.Now()}
 	b.mediaMu.Unlock()
 
-	mediaURL := "http://" + defaultAddr + "/v1/media/" + token
-	writeJSON(w, http.StatusOK, resolveResponse{URL: mediaURL, Quality: st.Quality, Provider: req.Provider})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"url":"http://"+addr+"/v1/media/"+token,
+		"quality":st.Quality,
+		"provider":provider,
+	})
 }
 
 func (b *bridge) mediaProxy(w http.ResponseWriter, r *http.Request) {
@@ -359,11 +295,10 @@ func (b *bridge) mediaProxy(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-
 	b.mediaMu.RLock()
 	entry, ok := b.media[token]
 	b.mediaMu.RUnlock()
-	if !ok || time.Since(entry.CreatedAt) > mediaTTL {
+	if !ok || time.Since(entry.Created) > mediaTTL {
 		http.Error(w, "media token expired", http.StatusGone)
 		return
 	}
@@ -373,338 +308,436 @@ func (b *bridge) mediaProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad upstream", http.StatusBadGateway)
 		return
 	}
-	for key, values := range entry.Headers {
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
+	for k, values := range entry.Headers {
+		for _, v := range values { req.Header.Add(k, v) }
 	}
 	req.Header.Set("Accept-Encoding", "identity")
-	if v := r.Header.Get("Range"); v != "" {
-		req.Header.Set("Range", v)
-	}
-	if v := r.Header.Get("If-Range"); v != "" {
-		req.Header.Set("If-Range", v)
-	}
+	if v := r.Header.Get("Range"); v != "" { req.Header.Set("Range", v) }
+	if v := r.Header.Get("If-Range"); v != "" { req.Header.Set("If-Range", v) }
 
 	client := *b.mediaClient
 	client.CheckRedirect = func(redir *http.Request, via []*http.Request) error {
-		if len(via) >= 8 {
-			return errors.New("too many redirects")
-		}
-		for key, values := range entry.Headers {
-			redir.Header.Del(key)
-			for _, value := range values {
-				redir.Header.Add(key, value)
-			}
+		if len(via) >= 8 { return errors.New("too many redirects") }
+		for k := range redir.Header { redir.Header.Del(k) }
+		for k, values := range entry.Headers {
+			for _, v := range values { redir.Header.Add(k, v) }
 		}
 		redir.Header.Set("Accept-Encoding", "identity")
-		if v := req.Header.Get("Range"); v != "" {
-			redir.Header.Set("Range", v)
-		}
+		if v := req.Header.Get("Range"); v != "" { redir.Header.Set("Range", v) }
 		return nil
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("media %s: %v", entry.Provider, err)
 		http.Error(w, "upstream media error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-
-	for _, key := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Cache-Control"} {
-		if value := resp.Header.Get(key); value != "" {
-			w.Header().Set(key, value)
-		}
+	for _, k := range []string{"Content-Type","Content-Length","Content-Range","Accept-Ranges","ETag","Last-Modified","Cache-Control"} {
+		if v := resp.Header.Get(k); v != "" { w.Header().Set(k, v) }
 	}
-	if w.Header().Get("Accept-Ranges") == "" {
-		w.Header().Set("Accept-Ranges", "bytes")
-	}
+	if w.Header().Get("Accept-Ranges") == "" { w.Header().Set("Accept-Ranges", "bytes") }
 	w.WriteHeader(resp.StatusCode)
-	if r.Method == http.MethodHead {
-		return
-	}
-	_, _ = io.Copy(w, resp.Body)
+	if r.Method != http.MethodHead { _, _ = io.Copy(w, resp.Body) }
 }
 
 func (b *bridge) resolveOK(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
-	if id == "" || !regexp.MustCompile(`^-?\d+$`).MatchString(id) {
+	if id == "" || !regexp.MustCompile("^-?[0-9]+$").MatchString(id) {
 		return stream{}, nil, errors.New("invalid OK id")
 	}
-
-	form := url.Values{"mid": {id}}
-	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://www.ok.ru/dk?cmd=videoPlayerMetadata", strings.NewReader(form.Encode()), map[string]string{
-		"Accept":       "application/json,text/plain,*/*",
-		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-		"Origin":       "https://ok.ru",
-		"Referer":      "https://ok.ru/",
+	form := url.Values{"mid":{id}}
+	body, status, err := b.fetch(ctx, http.MethodPost, "https://www.ok.ru/dk?cmd=videoPlayerMetadata", strings.NewReader(form.Encode()), map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":"https://ok.ru",
+		"Referer":"https://ok.ru/",
 	})
 	if err == nil && status >= 200 && status < 300 {
-		if st, parseErr := parseOKMetadata(body, preferred); parseErr == nil {
+		if st, e := parseOKMetadata(body, preferred); e == nil {
 			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
 		}
 	}
 
-	embed := "https://ok.ru/videoembed/" + url.PathEscape(id)
-	page, status, pageErr := b.fetchRaw(ctx, http.MethodGet, embed, nil, map[string]string{
-		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
-		"Referer": "https://ok.ru/",
-	})
-	if pageErr != nil || status < 200 || status >= 300 {
-		if pageErr != nil {
-			return stream{}, nil, pageErr
-		}
-		return stream{}, nil, fmt.Errorf("OK embed status %d", status)
+	embed := "https://ok.ru/videoembed/"+url.PathEscape(id)
+	page, status, err := b.fetch(ctx, http.MethodGet, embed, nil, map[string]string{"Referer":"https://ok.ru/"})
+	if err != nil || status < 200 || status >= 300 {
+		return stream{}, nil, fmt.Errorf("OK embed unavailable")
 	}
-
 	player, err := parseOKPlayer(page, id)
-	if err != nil {
-		return stream{}, nil, err
-	}
-	flashvars, _ := player["flashvars"].(map[string]any)
-	if flashvars == nil {
-		return stream{}, nil, errors.New("OK flashvars missing")
-	}
+	if err != nil { return stream{}, nil, err }
+	flash, _ := player["flashvars"].(map[string]any)
+	if flash == nil { return stream{}, nil, errors.New("OK flashvars missing") }
 
-	if metadata, ok := flashvars["metadata"].(string); ok && metadata != "" {
-		if st, parseErr := parseOKMetadata([]byte(metadata), preferred); parseErr == nil {
+	if raw, ok := flash["metadata"].(string); ok && raw != "" {
+		if st, e := parseOKMetadata([]byte(raw), preferred); e == nil {
 			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
 		}
 	}
-	if metadata, ok := flashvars["metadata"].(map[string]any); ok {
-		raw, _ := json.Marshal(metadata)
-		if st, parseErr := parseOKMetadata(raw, preferred); parseErr == nil {
+	if obj, ok := flash["metadata"].(map[string]any); ok {
+		raw, _ := json.Marshal(obj)
+		if st, e := parseOKMetadata(raw, preferred); e == nil {
 			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
 		}
 	}
 
-	metadataURL, _ := flashvars["metadataUrl"].(string)
-	if metadataURL == "" {
-		return stream{}, nil, errors.New("OK metadata URL missing")
-	}
-	metadataURL, _ = url.QueryUnescape(metadataURL)
-	if strings.HasPrefix(metadataURL , "//") {
-		metadataURL = "https:" + metadataURL
-	} else if strings.HasPrefix(metadataURL , "/") {
-		metadataURL = "https://ok.ru" + metadataURL
-	}
-	location, _ := flashvars["location"].(string)
-	metaForm := url.Values{"st.location": {location}}
-	metaBody, metaStatus, metaErr := b.fetchRaw(ctx, http.MethodPost, metadataURL, strings.NewReader(metaForm.Encode()), map[string]string{
-		"Accept":       "application/json,text/plain,*/*",
-		"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
-		"Origin":       "https://ok.ru",
-		"Referer":      embed,
+	metaURL := anyString(flash["metadataUrl"])
+	if metaURL == "" { return stream{}, nil, errors.New("OK metadata URL missing") }
+	if decoded, e := url.QueryUnescape(metaURL); e == nil { metaURL = decoded }
+	if strings.HasPrefix(metaURL, "//") { metaURL = "https:"+metaURL }
+	if strings.HasPrefix(metaURL, "/") { metaURL = "https://ok.ru"+metaURL }
+	metaForm := url.Values{"st.location":{anyString(flash["location"])}}
+	meta, status, err := b.fetch(ctx, http.MethodPost, metaURL, strings.NewReader(metaForm.Encode()), map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":"https://ok.ru",
+		"Referer":embed,
 	})
-	if metaErr != nil {
-		return stream{}, nil, metaErr
-	}
-	if metaStatus < 200 || metaStatus >= 300 {
-		return stream{}, nil, fmt.Errorf("OK metadata status %d", metaStatus)
-	}
-	st, err := parseOKMetadata(metaBody, preferred)
+	if err != nil || status < 200 || status >= 300 { return stream{}, nil, errors.New("OK metadata request failed") }
+	st, err := parseOKMetadata(meta, preferred)
 	return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), err
 }
 
 func parseOKMetadata(body []byte, preferred int) (stream, error) {
 	var root map[string]any
-	if err := json.Unmarshal(body, &root); err != nil {
-		return stream{}, fmt.Errorf("OK metadata JSON: %w", err)
-	}
+	if err := json.Unmarshal(body, &root); err != nil { return stream{}, err }
 	rows, _ := root["videos"].([]any)
-	var candidates []stream
+	var list []stream
 	for _, item := range rows {
-		row, _ := item.(map[string]any)
-		if row == nil {
-			continue
-		}
-		u, _ := row["url"].(string)
-		if !isHTTPURL(u) {
-			continue
-		}
-		name, _ := row["name"].(string)
-		q := qualityOrder[strings.ToLower(name)]
+		row, _ := item.(map[string]any); if row == nil { continue }
+		u := anyString(row["url"]); if !httpURL(u) { continue }
+		q := qualityMap[strings.ToLower(anyString(row["name"]))]
 		if q == 0 {
-			if parsed, err := url.Parse(u); err == nil {
-				q = okTypeHeight[parsed.Query().Get("type")]
-			}
+			if parsed, e := url.Parse(u); e == nil { q = okTypeQuality(parsed.Query().Get("type")) }
 		}
-		candidates = append(candidates, stream{URL: u, Quality: q})
+		list = append(list, stream{URL:u, Quality:q})
 	}
-	if len(candidates) == 0 {
-		return stream{}, errors.New("OK returned no MP4 streams")
-	}
-	return chooseStream(candidates, preferred), nil
+	if len(list) == 0 { return stream{}, errors.New("OK returned no direct MP4 streams") }
+	return choose(list, preferred), nil
 }
 
 func parseOKPlayer(page []byte, id string) (map[string]any, error) {
 	text := string(page)
 	pos := 0
 	for {
-		idx := strings.Index(text[pos:], "data-options=")
-		if idx < 0 {
-			break
-		}
-		idx += pos + len("data-options=")
-		if idx >= len(text) {
-			break
-		}
-		quote := text[idx]
-		if quote != '\'' && quote != '"' {
-			pos = idx + 1
-			continue
-		}
-		end := strings.IndexByte(text[idx+1:], quote)
-		if end < 0 {
-			break
-		}
-		raw := html.UnescapeString(text[idx+1 : idx+1+end])
+		i := strings.Index(text[pos:], "data-options=")
+		if i < 0 { break }
+		i += pos + len("data-options=")
+		if i >= len(text) { break }
+		quote := text[i]
+		if quote != '\'' && quote != '"' { pos=i+1; continue }
+		end := strings.IndexByte(text[i+1:], quote)
+		if end < 0 { break }
+		raw := html.UnescapeString(text[i+1:i+1+end])
 		if strings.Contains(raw, id) {
-			var player map[string]any
-			if err := json.Unmarshal([]byte(raw), &player); err == nil {
-				return player, nil
-			}
+			var obj map[string]any
+			if json.Unmarshal([]byte(raw), &obj) == nil { return obj, nil }
 		}
-		pos = idx + 1 + end + 1
+		pos = i+1+end+1
 	}
 	return nil, errors.New("OK data-options missing")
 }
 
 func (b *bridge) resolveVK(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
-	if !reVKVideoID.MatchString(id) {
-		return stream{}, nil, errors.New("invalid VK id")
-	}
-	token, err := b.vkAnonymousToken(ctx)
+	if !vkIDRe.MatchString(id) { return stream{}, nil, errors.New("invalid VK id") }
+	token, err := b.vkAnonymousToken(ctx, false)
 	if err == nil {
-		endpoint := "https://api.vk.com/method/video.getByIds?v=5.282&client_id=52461373"
-		form := url.Values{
-			"access_token": {token},
-			"videos":       {id},
-			"video_fields": {"files"},
+		st, code, e := b.vkByID(ctx, id, preferred, token)
+		if code == 5 {
+			token, err = b.vkAnonymousToken(ctx, true)
+			if err == nil { st, _, e = b.vkByID(ctx, id, preferred, token) }
 		}
-		body, status, reqErr := b.fetchRaw(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()), map[string]string{
-			"Accept":       "application/json,text/plain,*/*",
-			"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
-			"Origin":       "https://vkvideo.ru",
-			"Referer":      "https://vkvideo.ru/",
-		})
-		if reqErr == nil && status >= 200 && status < 300 {
-			if st, parseErr := parseVKAPI(body, preferred); parseErr == nil {
-				return st, mediaHeaders("https://vk.com/", "https://vk.com"), nil
-			}
-		}
+		if e == nil { return st, mediaHeaders("https://vk.com/", "https://vk.com"), nil }
 	}
 
-	form := url.Values{"act": {"show"}, "al": {"1"}, "video": {id}}
-	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://vk.com/al_video.php?act=show", strings.NewReader(form.Encode()), map[string]string{
-		"Accept":           "application/json,text/plain,*/*",
-		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
-		"Origin":           "https://vk.com",
-		"Referer":          "https://vk.com/",
-		"X-Requested-With": "XMLHttpRequest",
+	form := url.Values{"act":{"show"}, "al":{"1"}, "video":{id}}
+	body, status, err := b.fetch(ctx, http.MethodPost, "https://vk.com/al_video.php?act=show", strings.NewReader(form.Encode()), map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":"https://vk.com",
+		"Referer":"https://vk.com/",
+		"X-Requested-With":"XMLHttpRequest",
 	})
-	if err != nil {
-		return stream{}, nil, err
-	}
-	if status < 200 || status >= 300 {
-		return stream{}, nil, fmt.Errorf("VK al_video status %d", status)
-	}
+	if err != nil || status < 200 || status >= 300 { return stream{}, nil, errors.New("VK al_video failed") }
 	st, err := parseVKPayload(body, preferred)
 	return st, mediaHeaders("https://vk.com/", "https://vk.com"), err
 }
 
+func (b *bridge) vkByID(ctx context.Context, id string, preferred int, token string) (stream, int, error) {
+	form := url.Values{"access_token":{token}, "videos":{id}, "video_fields":{"files"}}
+	body, status, err := b.fetch(ctx, http.MethodPost, "https://api.vk.com/method/video.getByIds?v=5.282&client_id=52461373", strings.NewReader(form.Encode()), map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":"https://vkvideo.ru",
+		"Referer":"https://vkvideo.ru/",
+	})
+	if err != nil || status < 200 || status >= 300 { return stream{}, 0, errors.New("VK video.getByIds failed") }
+	if code := vkErrorCode(body); code != 0 { return stream{}, code, fmt.Errorf("VK api error %d", code) }
+	st, err := parseVKAPI(body, preferred)
+	return st, 0, err
+}
+
 func parseVKAPI(body []byte, preferred int) (stream, error) {
 	var root map[string]any
-	if err := json.Unmarshal(body, &root); err != nil {
-		return stream{}, err
-	}
+	if err := json.Unmarshal(body, &root); err != nil { return stream{}, err }
 	response, _ := root["response"].(map[string]any)
 	items, _ := response["items"].([]any)
-	if len(items) == 0 {
-		return stream{}, errors.New("VK API returned no items")
-	}
+	if len(items) == 0 { return stream{}, errors.New("VK API returned no items") }
 	item, _ := items[0].(map[string]any)
 	files, _ := item["files"].(map[string]any)
-	return chooseVKFiles(files, preferred)
+	return chooseVK(files, preferred)
 }
 
 func parseVKPayload(body []byte, preferred int) (stream, error) {
-	text := strings.TrimSpace(string(body))
-	text = strings.TrimPrefix(text, "<!--")
+	text := strings.TrimSpace(strings.TrimPrefix(string(body), "<!--"))
 	var root any
-	if err := json.Unmarshal([]byte(text), &root); err != nil {
-		return stream{}, fmt.Errorf("VK payload JSON: %w", err)
-	}
-	var candidates []map[string]any
+	if json.Unmarshal([]byte(text), &root) != nil { return stream{}, errors.New("VK payload JSON invalid") }
+	var found []map[string]any
 	walkMaps(root, func(m map[string]any) {
-		if files, ok := m["files"].(map[string]any); ok {
-			candidates = append(candidates, files)
-		}
+		if files, ok := m["files"].(map[string]any); ok { found = append(found, files) }
 		if params, ok := m["params"].([]any); ok && len(params) > 0 {
-			if p, ok := params[0].(map[string]any); ok {
-				candidates = append(candidates, p)
-			}
+			if p, ok := params[0].(map[string]any); ok { found = append(found, p) }
 		}
 	})
-	for _, files := range candidates {
-		if st, err := chooseVKFiles(files, preferred); err == nil {
-			return st, nil
-		}
+	for _, files := range found {
+		if st, err := chooseVK(files, preferred); err == nil { return st, nil }
 	}
-	return stream{}, errors.New("VK payload contained no playable MP4")
+	return stream{}, errors.New("VK payload contains no direct MP4")
 }
 
-func chooseVKFiles(files map[string]any, preferred int) (stream, error) {
-	var candidates []stream
+func chooseVK(files map[string]any, preferred int) (stream, error) {
+	var list []stream
+	re := regexp.MustCompile("^(?:mp4_|url|cache)([0-9]{3,4})$")
 	for key, raw := range files {
-		u, ok := raw.(string)
-		if !ok || !isHTTPURL(u) {
-			continue
+		u, ok := raw.(string); if !ok || !httpURL(u) { continue }
+		m := re.FindStringSubmatch(key)
+		if len(m) == 2 {
+			q, _ := strconv.Atoi(m[1])
+			list = append(list, stream{URL:strings.ReplaceAll(u, "^", ""), Quality:q})
+		} else if key == "extra_data" || key == "live_mp4" || key == "postlive_mp4" {
+			list = append(list, stream{URL:strings.ReplaceAll(u, "^", ""), Quality:0})
 		}
-		match := reMP4Key.FindStringSubmatch(key)
-		if len(match) != 2 {
-			if key == "extra_data" || key == "live_mp4" || key == "postlive_mp4" {
-				candidates = append(candidates, stream{URL: strings.ReplaceAll(u, "^", ""), Quality: 0})
-			}
-			continue
-		}
-		q, _ := strconv.Atoi(match[1])
-		candidates = append(candidates, stream{URL: strings.ReplaceAll(u, "^", ""), Quality: q})
 	}
-	if len(candidates) == 0 {
-		return stream{}, errors.New("VK returned no MP4 streams")
-	}
-	return chooseStream(candidates, preferred), nil
+	if len(list) == 0 { return stream{}, errors.New("VK returned no direct MP4 streams") }
+	return choose(list, preferred), nil
 }
 
 func (b *bridge) resolveDzen(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
-	if id == "" || !regexp.MustCompile(`^[0-9a-z_-]+$`).MatchString(id) {
+	if id == "" || !regexp.MustCompile("^[0-9a-z_-]+$").MatchString(id) {
 		return stream{}, nil, errors.New("invalid Dzen id")
 	}
-	watch := "https://dzen.ru/video/watch/" + url.PathEscape(id)
-	body, status, err := b.fetchRaw(ctx, http.MethodGet, watch, nil, map[string]string{
-		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
-		"Referer": "https://dzen.ru/",
-	})
-	if err != nil {
-		return stream{}, nil, err
-	}
-	if status < 200 || status >= 300 {
-		return stream{}, nil, fmt.Errorf("Dzen watch status %d", status)
-	}
+	watch := "https://dzen.ru/video/watch/"+url.PathEscape(id)
+	page, status, err := b.fetch(ctx, http.MethodGet, watch, nil, map[string]string{"Referer":"https://dzen.ru/"})
+	if err != nil || status < 200 || status >= 300 { return stream{}, nil, errors.New("Dzen watch failed") }
 
-	root, err := extractDzenParams(string(body))
+	root, err := extractDzenParams(string(page))
 	if err != nil {
-		if redirect := extractDzenRedirect(string(body)); redirect != "" {
-			if strings.HasPrefix(redirect, "/") {
-				redirect = "https://dzen.ru" + redirect
-			}
-			redirectBody, redirectStatus, redirectErr := b.fetchRaw(ctx, http.MethodGet, redirect, nil, map[string]string{
-				"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Referer": watch,
-			})
-			if redirectErr == nil && redirectStatus >= 200 && redirectStatus < 300 {
-				root, err = extractDzenParams(string(redirectBody))
+		if ret := extractDzenRedirect(string(page)); ret != "" {
+			if strings.HasPrefix(ret, "/") { ret="https://dzen.ru"+ret }
+			page, status, err = b.fetch(ctx, http.MethodGet, ret, nil, map[string]string{"Referer":watch})
+			if err == nil && status >= 200 && status < 300 { root, err = extractDzenParams(string(page)) }
+		}
+	}
+	if err != nil { return stream{}, nil, err }
+	ssr, _ := root["ssrData"].(map[string]any)
+	meta, _ := ssr["videoMetaResponse"].(map[string]any)
+	video, _ := meta["video"].(map[string]any)
+	if video == nil { return stream{}, nil, errors.New("Dzen videoMetaResponse.video missing") }
+
+	var list []stream
+	add := func(u string, q int) {
+		if !httpURL(u) { return }
+		parsed, e := url.Parse(u); if e != nil { return }
+		ct := parsed.Query().Get("ct")
+		ext := strings.ToLower(pathExt(parsed.Path))
+		if ct != "0" && ext != ".mp4" && ext != ".m4v" { return }
+		values := parsed.Query(); values.Del("dzen_dash"); parsed.RawQuery=values.Encode()
+		if q == 0 { q=okTypeQuality(parsed.Query().Get("type")) }
+		list=append(list, stream{URL:parsed.String(), Quality:q})
+	}
+	if u, ok := video["id"].(string); ok { add(u,0) }
+	if rows, ok := video["streams"].([]any); ok {
+		for _, row := range rows { if u, ok := row.(string); ok { add(u,0) } }
+	}
+	for _, key := range []string{"mp4Streams","oneVideoStreams"} {
+		if rows, ok := video[key].([]any); ok {
+			for _, raw := range rows {
+				row, _ := raw.(map[string]any); if row == nil { continue }
+				q := anyInt(row["height"])
+				if q == 0 { q=qualityMap[strings.ToLower(anyString(row["type"]))] }
+				add(anyString(row["url"]), q)
 			}
 		}
-		if err != nil {
-			return stream{}, nil
+	}
+	list=dedupe(list)
+	if len(list)==0 { return stream{}, nil, errors.New("Dzen returned no direct MP4 streams") }
+	return choose(list, preferred), mediaHeaders("https://dzen.ru/", "https://dzen.ru"), nil
+}
+
+func extractDzenParams(text string) (map[string]any, error) {
+	start := -1
+	for _, marker := range []string{"var _params","let _params","const _params"} {
+		if i:=strings.Index(text,marker); i>=0 && (start<0 || i<start) { start=i }
+	}
+	if start<0 { return nil, errors.New("Dzen _params missing") }
+	brace:=strings.Index(text[start:],"{"); if brace<0 { return nil, errors.New("Dzen object missing") }
+	raw, ok:=balancedObject(text,start+brace); if !ok { return nil, errors.New("Dzen object malformed") }
+	var root map[string]any
+	if json.Unmarshal([]byte(raw),&root)!=nil { return nil, errors.New("Dzen params JSON invalid") }
+	return root,nil
+}
+
+func extractDzenRedirect(text string) string {
+	for _, marker := range []string{"var it","let it","const it"} {
+		start:=strings.Index(text,marker); if start<0 { continue }
+		brace:=strings.Index(text[start:],"{"); if brace<0 { continue }
+		raw,ok:=balancedObject(text,start+brace); if !ok { continue }
+		var obj map[string]any
+		if json.Unmarshal([]byte(raw),&obj)==nil { if ret,ok:=obj["retpath"].(string); ok { return ret } }
+	}
+	return ""
+}
+
+func balancedObject(text string, start int) (string,bool) {
+	depth:=0; inString:=false; escaped:=false
+	for i:=start;i<len(text);i++ {
+		c:=text[i]
+		if inString {
+			if escaped { escaped=false } else if c=='\\' { escaped=true } else if c=='"' { inString=false }
+			continue
+		}
+		if c=='"' { inString=true; continue }
+		if c=='{' { depth++ } else if c=='}' { depth--; if depth==0 { return text[start:i+1],true } }
+	}
+	return "",false
+}
+
+func (b *bridge) vkAnonymousToken(ctx context.Context, force bool) (string,error) {
+	now:=time.Now().Unix()
+	b.vkMu.Lock()
+	defer b.vkMu.Unlock()
+	if !force && b.vkToken!="" && now+60<b.vkExpires { return b.vkToken,nil }
+
+	form:=url.Values{"client_id":{"52461373"}}
+	body,status,err:=b.fetch(ctx,http.MethodPost,"https://login.vk.com/?act=get_anonym_token",strings.NewReader(form.Encode()),map[string]string{
+		"Accept":"application/json,text/plain,*/*",
+		"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":"https://vkvideo.ru",
+		"Referer":"https://vkvideo.ru/",
+	})
+	if err!=nil { return "",err }
+	if status<200 || status>=300 { return "",fmt.Errorf("VK token status %d",status) }
+	var root map[string]any
+	if json.Unmarshal(body,&root)!=nil { return "",errors.New("VK token JSON invalid") }
+	if anyString(root["type"])!="okay" { return "",errors.New("VK token rejected") }
+	data,_:=root["data"].(map[string]any)
+	token:=anyString(data["access_token"]); if token=="" { return "",errors.New("VK token missing") }
+	b.vkToken=token
+	b.vkExpires=int64(anyInt(data["expired_at"])); if b.vkExpires==0 { b.vkExpires=now+600 }
+	return token,nil
+}
+
+func vkErrorCode(body []byte) int {
+	var root map[string]any
+	if json.Unmarshal(body,&root)!=nil { return 0 }
+	errObj,_:=root["error"].(map[string]any)
+	return anyInt(errObj["error_code"])
+}
+
+func (b *bridge) fetch(ctx context.Context, method,target string, body io.Reader, headers map[string]string) ([]byte,int,error) {
+	req,err:=http.NewRequestWithContext(ctx,method,target,body); if err!=nil { return nil,0,err }
+	req.Header.Set("User-Agent",userAgent)
+	for k,v:=range headers { req.Header.Set(k,v) }
+	resp,err:=b.client.Do(req); if err!=nil { return nil,0,err }
+	defer resp.Body.Close()
+	data,err:=io.ReadAll(io.LimitReader(resp.Body,16<<20))
+	return data,resp.StatusCode,err
+}
+
+func mediaHeaders(referer,origin string) http.Header {
+	h:=make(http.Header)
+	h.Set("User-Agent",userAgent)
+	if referer!="" { h.Set("Referer",referer) }
+	if origin!="" { h.Set("Origin",origin) }
+	return h
+}
+
+func choose(list []stream, preferred int) stream {
+	sort.SliceStable(list,func(i,j int)bool{
+		a,b:=list[i].Quality,list[j].Quality
+		if preferred<=0 { return a>b }
+		ad,bd:=abs(a-preferred),abs(b-preferred)
+		if a==0 { ad=1<<30 }; if b==0 { bd=1<<30 }
+		if ad!=bd { return ad<bd }
+		ab,bb:=a>0&&a<=preferred,b>0&&b<=preferred
+		if ab!=bb { return ab }
+		return a>b
+	})
+	return list[0]
+}
+
+func dedupe(in []stream) []stream {
+	seen:=map[string]bool{}; out:=make([]stream,0,len(in))
+	for _,st:=range in { if st.URL!=""&&!seen[st.URL] { seen[st.URL]=true; out=append(out,st) } }
+	return out
+}
+
+func walkMaps(v any, fn func(map[string]any)) {
+	switch x:=v.(type) {
+	case map[string]any:
+		fn(x); for _,child:=range x { walkMaps(child,fn) }
+	case []any:
+		for _,child:=range x { walkMaps(child,fn) }
+	}
+}
+
+func randomToken() (string,error) {
+	buf:=make([]byte,24); if _,err:=rand.Read(buf); err!=nil { return "",err }
+	return base64.RawURLEncoding.EncodeToString(buf),nil
+}
+
+func writeJSON(w http.ResponseWriter,status int,value any) {
+	w.Header().Set("Content-Type","application/json; charset=utf-8")
+	w.WriteHeader(status); _=json.NewEncoder(w).Encode(value)
+}
+
+func upstreamError(w http.ResponseWriter,name string,status int,err error) {
+	detail:="upstream request failed"; if err!=nil { detail=err.Error() }
+	log.Printf("%s: status=%d err=%v",name,status,err)
+	writeJSON(w,http.StatusBadGateway,map[string]any{"error":name,"status":status,"detail":detail})
+}
+
+func okTypeQuality(t string) int {
+	switch t { case "4":return 144; case "0":return 240; case "1":return 360; case "2":return 480; case "3":return 720; case "5":return 1080; case "6":return 1440; case "7":return 2160 }
+	return 0
+}
+
+func anyString(v any) string { if s,ok:=v.(string); ok { return s }; return "" }
+
+func anyInt(v any) int {
+	switch x:=v.(type) {
+	case float64: return int(x)
+	case int: return x
+	case json.Number: n,_:=strconv.Atoi(x.String()); return n
+	case string: n,_:=strconv.Atoi(x); return n
+	}
+	return 0
+}
+
+func httpURL(raw string) bool { return strings.HasPrefix(raw,"https://")||strings.HasPrefix(raw,"http://") }
+
+func pathExt(path string) string {
+	dot:=strings.LastIndex(path,"."); slash:=strings.LastIndex(path,"/")
+	if dot<=slash { return "" }; return path[dot:]
+}
+
+func abs(v int) int { if v<0 { return -v }; return v }
+
+func (b *bridge) cleanup() {
+	t:=time.NewTicker(10*time.Minute); defer t.Stop()
+	for range t.C {
+		cutoff:=time.Now().Add(-mediaTTL)
+		b.mediaMu.Lock()
+		for k,v:=range b.media { if v.Created.Before(cutoff) { delete(b.media,k) } }
+		b.mediaMu.Unlock()
+	}
+}
