@@ -162,4 +162,133 @@ func (b *bridge) withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 func (b *bridge) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAll
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": bridgeVersion})
+}
+
+func (b *bridge) searchOK(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "missing q", http.StatusBadRequest)
+		return
+	}
+
+	target := "https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=" + url.QueryEscape(q) + "&st.m=SEARCH"
+	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer": "https://ok.ru/",
+	})
+	if err != nil {
+		writeUpstreamError(w, "ok-search", err)
+		return
+	}
+	if status < 200 || status >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "ok-search-status", "status": status})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+func (b *bridge) searchDzen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "missing q", http.StatusBadRequest)
+		return
+	}
+
+	target := "https://dzen.ru/api/web/v1/zen-search?country_code=ru&forced_request_type=long_video_search&query=" + url.QueryEscape(q) + "&clid=1400&type_filter=video&lang=ru"
+	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":  "application/json,text/plain,*/*",
+		"Referer": "https://dzen.ru/",
+	})
+	if err != nil {
+		writeUpstreamError(w, "dzen-search", err)
+		return
+	}
+	if status < 200 || status >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "dzen-search-status", "status": status})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+func (b *bridge) searchDzenHTML(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "missing q", http.StatusBadRequest)
+		return
+	}
+
+	target := "https://dzen.ru/search?query=" + url.QueryEscape(q) + "&type_filter=video"
+	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, target, nil, map[string]string{
+		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer": "https://dzen.ru/",
+	})
+	if err != nil {
+		writeUpstreamError(w, "dzen-search-html", err)
+		return
+	}
+	if status < 200 || status >= 300 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "dzen-search-html-status", "status": status})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+func (b *bridge) searchVK(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		http.Error(w, "missing q", http.StatusBadRequest)
+		return
+	}
+
+	token, err := b.vkAnonymousToken(r.Context())
+	if err != nil {
+		writeUpstreamError(w, "vk-token", err)
+		return
+	}
+
+	endpoint := "https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2?v=5.282&client_id=52461373&count=30&q=" + url.QueryEscape(q) + "&content_type=video&access_token=" + url.QueryEscape(token)
+	body, status, err := b.fetchRaw(r.Context(), http.MethodGet, endpoint, nil, map[string]string{
+		"Accept":  "application/json,text/plain,*/*",
+		"Referer": "https://vkvideo.ru/",
+		"Origin":  "https://vkvideo.ru",
+	})
+	if err == nil && vkErrorCode(body) == 5 {
+		b.vkMu.Lock()
+		b.vkToken, b.vkExpires = "", 0
+		b.vkMu.Unlock()
+		if refreshed, tokenErr := b.vkAnonymousToken(r.Context()); tokenErr == nil {
+			endpoint = "https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2?v=5.282&client_id=52461373&count=30&q=" + url.QueryEscape(q) + "&content_type=video&access_token=" + url.QueryEscape(refreshed)
+			body, status, err = b.fetchRaw(r.Context(), http.MethodGet, endpoint, nil, map[string]string{
+				"Accept": "application/json,text/plain,*/*", "Referer": "https://vkvideo.ru/", "Origin": "https://vkvideo.ru",
+			})
+		}
+	}
+	if err != nil {
+		writeUpstreamError(w, "vk-search", err)
+		return
+	}
+	if status < 200 || status >= 300 {
+		writeJSON(w, http.StatusBadGate
