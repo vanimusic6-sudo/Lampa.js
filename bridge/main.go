@@ -436,4 +436,275 @@ func (b *bridge) resolveOK(ctx context.Context, id string, preferred int) (strea
 	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://www.ok.ru/dk?cmd=videoPlayerMetadata", strings.NewReader(form.Encode()), map[string]string{
 		"Accept":       "application/json,text/plain,*/*",
 		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-		"O
+		"Origin":       "https://ok.ru",
+		"Referer":      "https://ok.ru/",
+	})
+	if err == nil && status >= 200 && status < 300 {
+		if st, parseErr := parseOKMetadata(body, preferred); parseErr == nil {
+			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
+		}
+	}
+
+	embed := "https://ok.ru/videoembed/" + url.PathEscape(id)
+	page, status, pageErr := b.fetchRaw(ctx, http.MethodGet, embed, nil, map[string]string{
+		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer": "https://ok.ru/",
+	})
+	if pageErr != nil || status < 200 || status >= 300 {
+		if pageErr != nil {
+			return stream{}, nil, pageErr
+		}
+		return stream{}, nil, fmt.Errorf("OK embed status %d", status)
+	}
+
+	player, err := parseOKPlayer(page, id)
+	if err != nil {
+		return stream{}, nil, err
+	}
+	flashvars, _ := player["flashvars"].(map[string]any)
+	if flashvars == nil {
+		return stream{}, nil, errors.New("OK flashvars missing")
+	}
+
+	if metadata, ok := flashvars["metadata"].(string); ok && metadata != "" {
+		if st, parseErr := parseOKMetadata([]byte(metadata), preferred); parseErr == nil {
+			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
+		}
+	}
+	if metadata, ok := flashvars["metadata"].(map[string]any); ok {
+		raw, _ := json.Marshal(metadata)
+		if st, parseErr := parseOKMetadata(raw, preferred); parseErr == nil {
+			return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), nil
+		}
+	}
+
+	metadataURL, _ := flashvars["metadataUrl"].(string)
+	if metadataURL == "" {
+		return stream{}, nil, errors.New("OK metadata URL missing")
+	}
+	metadataURL, _ = url.QueryUnescape(metadataURL)
+	if strings.HasPrefix(metadataURL , "//") {
+		metadataURL = "https:" + metadataURL
+	} else if strings.HasPrefix(metadataURL , "/") {
+		metadataURL = "https://ok.ru" + metadataURL
+	}
+	location, _ := flashvars["location"].(string)
+	metaForm := url.Values{"st.location": {location}}
+	metaBody, metaStatus, metaErr := b.fetchRaw(ctx, http.MethodPost, metadataURL, strings.NewReader(metaForm.Encode()), map[string]string{
+		"Accept":       "application/json,text/plain,*/*",
+		"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
+		"Origin":       "https://ok.ru",
+		"Referer":      embed,
+	})
+	if metaErr != nil {
+		return stream{}, nil, metaErr
+	}
+	if metaStatus < 200 || metaStatus >= 300 {
+		return stream{}, nil, fmt.Errorf("OK metadata status %d", metaStatus)
+	}
+	st, err := parseOKMetadata(metaBody, preferred)
+	return st, mediaHeaders("https://ok.ru/", "https://ok.ru"), err
+}
+
+func parseOKMetadata(body []byte, preferred int) (stream, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return stream{}, fmt.Errorf("OK metadata JSON: %w", err)
+	}
+	rows, _ := root["videos"].([]any)
+	var candidates []stream
+	for _, item := range rows {
+		row, _ := item.(map[string]any)
+		if row == nil {
+			continue
+		}
+		u, _ := row["url"].(string)
+		if !isHTTPURL(u) {
+			continue
+		}
+		name, _ := row["name"].(string)
+		q := qualityOrder[strings.ToLower(name)]
+		if q == 0 {
+			if parsed, err := url.Parse(u); err == nil {
+				q = okTypeHeight[parsed.Query().Get("type")]
+			}
+		}
+		candidates = append(candidates, stream{URL: u, Quality: q})
+	}
+	if len(candidates) == 0 {
+		return stream{}, errors.New("OK returned no MP4 streams")
+	}
+	return chooseStream(candidates, preferred), nil
+}
+
+func parseOKPlayer(page []byte, id string) (map[string]any, error) {
+	text := string(page)
+	pos := 0
+	for {
+		idx := strings.Index(text[pos:], "data-options=")
+		if idx < 0 {
+			break
+		}
+		idx += pos + len("data-options=")
+		if idx >= len(text) {
+			break
+		}
+		quote := text[idx]
+		if quote != '\'' && quote != '"' {
+			pos = idx + 1
+			continue
+		}
+		end := strings.IndexByte(text[idx+1:], quote)
+		if end < 0 {
+			break
+		}
+		raw := html.UnescapeString(text[idx+1 : idx+1+end])
+		if strings.Contains(raw, id) {
+			var player map[string]any
+			if err := json.Unmarshal([]byte(raw), &player); err == nil {
+				return player, nil
+			}
+		}
+		pos = idx + 1 + end + 1
+	}
+	return nil, errors.New("OK data-options missing")
+}
+
+func (b *bridge) resolveVK(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
+	if !reVKVideoID.MatchString(id) {
+		return stream{}, nil, errors.New("invalid VK id")
+	}
+	token, err := b.vkAnonymousToken(ctx)
+	if err == nil {
+		endpoint := "https://api.vk.com/method/video.getByIds?v=5.282&client_id=52461373"
+		form := url.Values{
+			"access_token": {token},
+			"videos":       {id},
+			"video_fields": {"files"},
+		}
+		body, status, reqErr := b.fetchRaw(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()), map[string]string{
+			"Accept":       "application/json,text/plain,*/*",
+			"Content-Type": "application/x-ww-form-urlencoded; charset=UTF-8",
+			"Origin":       "https://vkvideo.ru",
+			"Referer":      "https://vkvideo.ru/",
+		})
+		if reqErr == nil && status >= 200 && status < 300 {
+			if st, parseErr := parseVKAPI(body, preferred); parseErr == nil {
+				return st, mediaHeaders("https://vk.com/", "https://vk.com"), nil
+			}
+		}
+	}
+
+	form := url.Values{"act": {"show"}, "al": {"1"}, "video": {id}}
+	body, status, err := b.fetchRaw(ctx, http.MethodPost, "https://vk.com/al_video.php?act=show", strings.NewReader(form.Encode()), map[string]string{
+		"Accept":           "application/json,text/plain,*/*",
+		"Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+		"Origin":           "https://vk.com",
+		"Referer":          "https://vk.com/",
+		"X-Requested-With": "XMLHttpRequest",
+	})
+	if err != nil {
+		return stream{}, nil, err
+	}
+	if status < 200 || status >= 300 {
+		return stream{}, nil, fmt.Errorf("VK al_video status %d", status)
+	}
+	st, err := parseVKPayload(body, preferred)
+	return st, mediaHeaders("https://vk.com/", "https://vk.com"), err
+}
+
+func parseVKAPI(body []byte, preferred int) (stream, error) {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return stream{}, err
+	}
+	response, _ := root["response"].(map[string]any)
+	items, _ := response["items"].([]any)
+	if len(items) == 0 {
+		return stream{}, errors.New("VK API returned no items")
+	}
+	item, _ := items[0].(map[string]any)
+	files, _ := item["files"].(map[string]any)
+	return chooseVKFiles(files, preferred)
+}
+
+func parseVKPayload(body []byte, preferred int) (stream, error) {
+	text := strings.TrimSpace(string(body))
+	text = strings.TrimPrefix(text, "<!--")
+	var root any
+	if err := json.Unmarshal([]byte(text), &root); err != nil {
+		return stream{}, fmt.Errorf("VK payload JSON: %w", err)
+	}
+	var candidates []map[string]any
+	walkMaps(root, func(m map[string]any) {
+		if files, ok := m["files"].(map[string]any); ok {
+			candidates = append(candidates, files)
+		}
+		if params, ok := m["params"].([]any); ok && len(params) > 0 {
+			if p, ok := params[0].(map[string]any); ok {
+				candidates = append(candidates, p)
+			}
+		}
+	})
+	for _, files := range candidates {
+		if st, err := chooseVKFiles(files, preferred); err == nil {
+			return st, nil
+		}
+	}
+	return stream{}, errors.New("VK payload contained no playable MP4")
+}
+
+func chooseVKFiles(files map[string]any, preferred int) (stream, error) {
+	var candidates []stream
+	for key, raw := range files {
+		u, ok := raw.(string)
+		if !ok || !isHTTPURL(u) {
+			continue
+		}
+		match := reMP4Key.FindStringSubmatch(key)
+		if len(match) != 2 {
+			if key == "extra_data" || key == "live_mp4" || key == "postlive_mp4" {
+				candidates = append(candidates, stream{URL: strings.ReplaceAll(u, "^", ""), Quality: 0})
+			}
+			continue
+		}
+		q, _ := strconv.Atoi(match[1])
+		candidates = append(candidates, stream{URL: strings.ReplaceAll(u, "^", ""), Quality: q})
+	}
+	if len(candidates) == 0 {
+		return stream{}, errors.New("VK returned no MP4 streams")
+	}
+	return chooseStream(candidates, preferred), nil
+}
+
+func (b *bridge) resolveDzen(ctx context.Context, id string, preferred int) (stream, http.Header, error) {
+	if id == "" || !regexp.MustCompile(`^[0-9a-z_-]+$`).MatchString(id) {
+		return stream{}, nil, errors.New("invalid Dzen id")
+	}
+	watch := "https://dzen.ru/video/watch/" + url.PathEscape(id)
+	body, status, err := b.fetchRaw(ctx, http.MethodGet, watch, nil, map[string]string{
+		"Accept":  "text/html,application/xhtml+xml,*/*;q=0.8",
+		"Referer": "https://dzen.ru/",
+	})
+	if err != nil {
+		return stream{}, nil, err
+	}
+	if status < 200 || status >= 300 {
+		return stream{}, nil, fmt.Errorf("Dzen watch status %d", status)
+	}
+
+	root, err := extractDzenParams(string(body))
+	if err != nil {
+		if redirect := extractDzenRedirect(string(body)); redirect != "" {
+			if strings.HasPrefix(redirect, "/") {
+				redirect = "https://dzen.ru" + redirect
+			}
+			redirectBody, redirectStatus, redirectErr := b.fetchRaw(ctx, http.MethodGet, redirect, nil, map[string]string{
+				"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Referer": watch,
+			})
+			if redirectErr == nil && redirectStatus >= 200 && redirectStatus < 300 {
+				root, err = extractDzenParams(string(redirectBody))
+			}
+		}
+		if err != nil {
+			return stream{}, nil
