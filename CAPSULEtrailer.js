@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.18.0';
+    var VERSION = '3.19.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v18';
+    var CACHE_KEY = 'capsule_trailer_cache_v19';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -1695,6 +1695,7 @@
                 kind: trailerKind(title),
                 official: /официальн|official/i.test(title),
                 vkId: videoId,
+                vkEmbed: String(video.player || ''),
                 url: 'https://vkvideo.ru/video' + videoId,
                 transportScore: 72,
                 exactMovieMatch: false
@@ -1805,6 +1806,9 @@
                 'first_frame_800', 'first_frame_640', 'image'
             ], 3200);
             var duration = nearestVkNumberField(text, at, 'duration', 2600);
+            var player = nearestVkStringField(text, at, ['player', 'player_url', 'playerUrl'], 4600);
+            if (/^\/\//.test(player)) player = 'https:' + player;
+            if (!/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(player)) player = '';
 
             var item = {
                 id: 'vk:' + videoId,
@@ -1822,7 +1826,8 @@
                 kind: trailerKind(title),
                 official: /официальн|official/i.test(title),
                 vkId: videoId,
-                url: 'https://vk.com/video' + videoId,
+                vkEmbed: player,
+                url: 'https://vkvideo.ru/video' + videoId,
                 transportScore: 62,
                 exactMovieMatch: false
             };
@@ -2089,51 +2094,312 @@
         try { Lampa.Controller.toggle('content'); } catch (e3) {}
     }
 
+    function normalizeEmbedUrl(value) {
+        value = decodeHtmlEntities(String(value || ''))
+            .replace(/\\u002f/gi, '/')
+            .replace(/\\\//g, '/')
+            .replace(/\\u0026/gi, '&');
+        if (/^\/\//.test(value)) value = 'https:' + value;
+        return value;
+    }
+
+    function vkEmbedFromText(text, item) {
+        text = normalizeEmbedUrl(text);
+        var re = /https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php\?[^"'<>\\\s]+/ig;
+        var matches = text.match(re) || [];
+        if (!matches.length) return '';
+
+        var id = item && item.vkId ? String(item.vkId) : '';
+        var parts = id.match(/^(-?\d+)_(\d+)$/);
+
+        if (parts) {
+            for (var i = 0; i < matches.length; i++) {
+                var candidate = matches[i];
+                if (candidate.indexOf('oid=' + parts[1]) >= 0 && candidate.indexOf('id=' + parts[2]) >= 0) {
+                    return candidate.replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
+                }
+            }
+        }
+
+        return matches[0].replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
+    }
+
+    function dzenEmbedFromText(text, item) {
+        text = normalizeEmbedUrl(text);
+        var re = /https?:\/\/dzen\.ru\/embed\/[0-9a-z_-]+(?:\?[^"'<>\\\s]*)?/ig;
+        var matches = text.match(re) || [];
+        if (!matches.length) return '';
+
+        var id = item && item.dzenId ? String(item.dzenId) : '';
+        if (id) {
+            for (var i = 0; i < matches.length; i++) {
+                var at = text.indexOf(matches[i]);
+                if (at >= 0) {
+                    var around = text.slice(Math.max(0, at - 5000), Math.min(text.length, at + 5000));
+                    if (around.indexOf(id) >= 0) return matches[i];
+                }
+            }
+        }
+
+        return matches[0];
+    }
+
+    function browserCanEmbedProvider(provider) {
+        return !!(isBrowserHttpTransport() && provider &&
+            (provider.id === 'ok' || provider.id === 'vk' || provider.id === 'dzen'));
+    }
+
+    function resolveBrowserEmbed(provider, item, context, done) {
+        if (!browserCanEmbedProvider(provider) || !item) {
+            done(new Error('browser-embed-provider'));
+            return function () {};
+        }
+
+        var immediate = browserEmbedUrl(provider, item);
+        if (immediate) {
+            done(null, immediate);
+            return function () {};
+        }
+
+        var cancelled = false;
+        var cancelCurrent = null;
+
+        function finish(error, url) {
+            if (cancelled) return;
+            done(error, url);
+        }
+
+        if (provider.id === 'vk') {
+            var page = item.url || ('https://vkvideo.ru/video' + String(item.vkId || ''));
+            cancelCurrent = textRequest(page, 6500, function (error, text) {
+                if (cancelled) return;
+                var embed = !error && text ? vkEmbedFromText(text, item) : '';
+
+                if (!embed && item.vkId) {
+                    var parts = String(item.vkId).match(/^(-?\d+)_(\d+)$/);
+                    if (parts) {
+                        embed = 'https://vkvideo.ru/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
+                            '&id=' + encodeURIComponent(parts[2]) + '&hd=2';
+                    }
+                }
+
+                if (!embed) return finish(error || new Error('vk-embed'));
+                finish(null, embed);
+            });
+
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
+        }
+
+        if (provider.id === 'dzen') {
+            var watch = item.url || ('https://dzen.ru/video/watch/' + String(item.dzenId || ''));
+            cancelCurrent = textRequest(watch, 6500, function (error, text) {
+                if (cancelled) return;
+                var embed = !error && text ? dzenEmbedFromText(text, item) : '';
+
+                if (embed) {
+                    finish(null, embed);
+                    return;
+                }
+
+                var query = [item.title || '', item.dzenId || '', 'Дзен'].join(' ').replace(/\s+/g, ' ');
+                var yandex = 'https://yandex.ru/video/search?text=' + encodeURIComponent(query);
+                cancelCurrent = textRequest(yandex, 6500, function (searchError, searchText) {
+                    if (cancelled) return;
+                    var yandexEmbed = !searchError && searchText ? dzenEmbedFromText(searchText, item) : '';
+                    if (!yandexEmbed) return finish(searchError || error || new Error('dzen-embed'));
+                    finish(null, yandexEmbed);
+                });
+            });
+
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
+        }
+
+        finish(new Error('browser-embed-missing'));
+        return function () {};
+    }
+
+    function capsuleEmbedMediaUrl(url) {
+        url = String(url || '');
+        if (!url) return '';
+        return url.replace(/#.*$/, '') + '#capsule-embed';
+    }
+
+    function createCapsuleEmbedTube(callVideo) {
+        var object = $('<div class="player-video__capsule-embed"></div>');
+        var video = object[0];
+        var frame = null;
+        var streamUrl = '';
+        var paused = false;
+        var volume = 1;
+        var muted = false;
+        var destroyed = false;
+
+        function emit(name) {
+            if (destroyed) return;
+            try {
+                var event = document.createEvent('Event');
+                event.initEvent(name, false, false);
+                video.dispatchEvent(event);
+            }
+            catch (e) {}
+        }
+
+        function cleanSource(url) {
+            return String(url || '').replace(/#capsule-embed.*$/i, '');
+        }
+
+        function define(name, getter, setter) {
+            try {
+                Object.defineProperty(video, name, {
+                    configurable: true,
+                    get: getter,
+                    set: setter || function () {}
+                });
+            }
+            catch (e) {}
+        }
+
+        define('src', function () { return streamUrl; }, function (url) {
+            streamUrl = cleanSource(url);
+        });
+        define('currentTime', function () { return 0; }, function () {});
+        define('duration', function () { return 0; });
+        define('paused', function () { return paused; });
+        define('audioTracks', function () { return []; });
+        define('textTracks', function () { return []; });
+        define('videoWidth', function () { return 1280; });
+        define('videoHeight', function () { return 720; });
+        define('buffered', function () {
+            return { length: 0, start: function () { return 0; }, end: function () { return 0; } };
+        });
+        define('volume', function () { return volume; }, function (value) {
+            volume = Math.max(0, Math.min(1, parseFloat(value) || 0));
+        });
+        define('muted', function () { return muted; }, function (value) {
+            muted = !!value;
+        });
+
+        video.canPlayType = function () { return true; };
+        video.size = function () {};
+        video.speed = function () {};
+        video.resize = function () {};
+
+        video.load = function () {
+            if (!streamUrl || frame || destroyed) return;
+
+            frame = document.createElement('iframe');
+            frame.className = 'player-video__capsule-embed-frame';
+            frame.src = streamUrl;
+            frame.setAttribute('frameborder', '0');
+            frame.setAttribute('allowfullscreen', 'true');
+            frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture; screen-wake-lock');
+            frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+
+            frame.onload = function () {
+                if (destroyed) return;
+                paused = false;
+                emit('canplay');
+                emit('loadeddata');
+                emit('playing');
+            };
+
+            frame.onerror = function () {
+                if (destroyed) return;
+                try { video.error = { code: 4, message: 'CAPSULE EMBED LOAD' }; } catch (e) {}
+                emit('error');
+            };
+
+            object.empty().append(frame);
+        };
+
+        video.play = function () {
+            paused = false;
+            emit('playing');
+            try { return Promise.resolve(); } catch (e) {}
+        };
+
+        video.pause = function () {
+            paused = false;
+            try { return Promise.resolve(); } catch (e) {}
+        };
+
+        video.destroy = function () {
+            destroyed = true;
+            if (frame) {
+                try { frame.src = 'about:blank'; } catch (e) {}
+                try { frame.remove(); } catch (e2) {}
+            }
+            frame = null;
+            object.remove();
+        };
+
+        callVideo(video);
+        return object;
+    }
+
     function browserEmbedUrl(provider, item) {
-        if (!isBrowserHttpTransport() || !provider || !item) return '';
+        if (!browserCanEmbedProvider(provider) || !item) return '';
 
         if (provider.id === 'ok' && item.okId) {
             return 'https://ok.ru/videoembed/' + encodeURIComponent(item.okId) + '?autoplay=1';
         }
 
-        if (provider.id === 'vk' && item.vkId) {
-            var parts = String(item.vkId).match(/^(-?\d+)_(\d+)$/);
-            if (!parts) return '';
-            return 'https://vk.com/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
-                '&id=' + encodeURIComponent(parts[2]) + '&autoplay=1';
+        if (provider.id === 'vk' && item.vkEmbed) {
+            var player = normalizeEmbedUrl(item.vkEmbed);
+            if (/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(player)) {
+                player = player.replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
+                if (player.indexOf('autoplay=') < 0) player += (player.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1';
+                return player;
+            }
         }
 
         if (provider.id === 'dzen' && item.dzenEmbed && /^https?:\/\/dzen\.ru\/embed\//i.test(item.dzenEmbed)) {
-            return item.dzenEmbed + (item.dzenEmbed.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1';
+            return item.dzenEmbed + (item.dzenEmbed.indexOf('autoplay=') >= 0 ? '' :
+                (item.dzenEmbed.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1');
         }
 
         return '';
     }
 
     function browserPlay(provider, item, context, done) {
-        var url = browserEmbedUrl(provider, item);
-        if (!url || !Lampa.Iframe || typeof Lampa.Iframe.show !== 'function') {
+        if (!browserCanEmbedProvider(provider)) {
             if (done) done(false);
             return false;
         }
 
-        try {
-            closeSourceSelectionState();
-            Lampa.Iframe.show({
-                url: url,
-                onBack: function () {
-                    try { Lampa.Controller.toggle(NAV_CONTROLLER); } catch (e) {}
-                }
-            });
-            log('browser embed playback', provider.id, url);
-            if (done) done(true);
-            return true;
-        }
-        catch (e) {
-            log('browser embed error', provider.id, e);
-            if (done) done(false);
-            return false;
-        }
+        resolveBrowserEmbed(provider, item, context, function (error, url) {
+            if (error || !url) {
+                log('browser embed resolve error', provider.id, error);
+                if (done) done(false);
+                return;
+            }
+
+            try {
+                closeSourceSelectionState();
+                Lampa.Player.play({
+                    url: capsuleEmbedMediaUrl(url),
+                    title: item.title,
+                    card: context.movie,
+                    capsule_trailer: true,
+                    capsule_source: provider.id + '-embed',
+                    capsule_embed: true
+                });
+                log('browser player embed', provider.id, url);
+                if (done) done(true);
+            }
+            catch (e) {
+                log('browser Player.play embed error', provider.id, e);
+                if (done) done(false);
+            }
+        });
+
+        return true;
     }
 
     function collectAutoplayCandidates(context, done) {
@@ -2267,8 +2533,7 @@
                     return;
                 }
 
-                var embed = browserEmbedUrl(selected.provider, selected.item);
-                if (embed) {
+                if (browserCanEmbedProvider(selected.provider)) {
                     if (browserPlay(selected.provider, selected.item, context, function (opened) {
                         if (opened) done(true);
                         else next();
@@ -2319,6 +2584,21 @@
 
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
+
+        if (!window.capsule_trailer_embed_tube) {
+            var embedRegistration = {
+                name: 'CAPSULE EMBED',
+                verify: function (src) {
+                    return isBrowserHttpTransport() && String(src || '').indexOf('#capsule-embed') >= 0;
+                },
+                create: createCapsuleEmbedTube
+            };
+
+            if (Lampa.PlayerVideo.registerTube(embedRegistration)) {
+                window.capsule_trailer_embed_tube = embedRegistration;
+            }
+        }
+
         if (window.capsule_trailer_media_tube) return;
 
         var probe = document.createElement('video');
@@ -2359,6 +2639,7 @@
 
         Lampa.Player.listener.follow('start', function (data) {
             if (!data || !data.capsule_trailer) return;
+            if (data.capsule_embed) return;
 
             var active = true;
             var used = false;
@@ -2468,6 +2749,8 @@
         var style = document.createElement('style');
         style.id = 'capsule-trailer-style';
         style.textContent = '' +
+            '.player-video__capsule-embed{position:absolute;inset:0;width:100%;height:100%;background:#000;overflow:hidden}' +
+            '.player-video__capsule-embed-frame{display:block;width:100%;height:100%;border:0;background:#000}' +
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box;background:#17181a}' +
             '.capsule-trailer{width:100%;min-height:100%;box-sizing:border-box;color:inherit;background:#17181a;padding-bottom:3em}' +
 
@@ -3040,8 +3323,15 @@
         function play(item, provider) {
             if (!alive || !provider) return;
 
-            var embed = browserEmbedUrl(provider, item);
-            if (embed && browserPlay(provider, item, context)) return;
+            if (browserCanEmbedProvider(provider)) {
+                self.activity.loader(true);
+                browserPlay(provider, item, context, function (opened) {
+                    if (!alive) return;
+                    self.activity.loader(false);
+                    if (!opened) Lampa.Noty.show('Видео недоступно в браузере');
+                });
+                return;
+            }
 
             if (typeof provider.resolve !== 'function') return;
             if (resolvingCancel) {
