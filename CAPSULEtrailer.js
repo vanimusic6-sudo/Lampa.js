@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.5.0';
+    var VERSION = '3.6.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v13';
+    var CACHE_KEY = 'capsule_trailer_cache_v14';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -239,6 +239,24 @@
             if (out.indexOf(matches[i]) < 0) out.push(matches[i]);
         }
         return out;
+    }
+
+    function titleHasMovieYear(item, movie) {
+        var year = yearOf(movie);
+        if (!year || !item) return false;
+        return explicitYears(item.title || '').indexOf(year) >= 0;
+    }
+
+    function preferMovieYear(items, movie, unwrap) {
+        items = items || [];
+        var exact = [];
+
+        for (var i = 0; i < items.length; i++) {
+            var candidate = unwrap ? unwrap(items[i]) : items[i];
+            if (candidate && titleHasMovieYear(candidate, movie)) exact.push(items[i]);
+        }
+
+        return exact.length ? exact : items;
     }
 
     function coverage(resultTitle, variant) {
@@ -1643,6 +1661,10 @@
                 if (Object.prototype.hasOwnProperty.call(candidates, key)) result.push(candidates[key]);
             }
 
+            result = preferMovieYear(result, context.movie, function (entry) {
+                return entry && entry.item;
+            });
+
             result.sort(function (a, b) {
                 return (b.item.score || 0) - (a.item.score || 0);
             });
@@ -1933,7 +1955,7 @@
 
             '.capsule-trailer__hero{position:relative;width:100%;height:25.5em;overflow:hidden;background:#17181a}' +
             '.capsule-trailer__backdrop{position:absolute;left:50%;top:1.65em;width:128%;max-width:none!important;height:calc(100% - 1.65em);object-fit:cover;object-position:50% 42%;opacity:.95;transform:translateX(-50%);transform-origin:center center;filter:saturate(.96) contrast(1.035)}' +
-            '.capsule-trailer__hero:before{content:"";position:absolute;z-index:1;inset:0;background:linear-gradient(180deg,#17181a 0%,#17181a 6%,rgba(23,24,26,.92) 11%,rgba(23,24,26,.66) 18%,rgba(23,24,26,.3) 26%,rgba(23,24,26,.08) 34%,rgba(23,24,26,0) 43%),linear-gradient(90deg,rgba(23,24,26,.22) 0%,rgba(23,24,26,.02) 52%,rgba(23,24,26,.065) 100%)}' +
+            '.capsule-trailer__hero:before{content:"";position:absolute;z-index:1;left:0;right:0;top:0;height:8.8em;background:linear-gradient(0deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.08) 24%,rgba(23,24,26,.34) 48%,rgba(23,24,26,.72) 72%,#17181a 100%),linear-gradient(90deg,rgba(23,24,26,.2) 0%,rgba(23,24,26,.02) 52%,rgba(23,24,26,.06) 100%);pointer-events:none}' +
             '.capsule-trailer__hero:after{content:"";position:absolute;z-index:1;left:0;right:0;top:36%;bottom:-1px;background:linear-gradient(180deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.025) 10%,rgba(23,24,26,.12) 24%,rgba(23,24,26,.34) 43%,rgba(23,24,26,.68) 63%,rgba(23,24,26,.9) 78%,rgba(23,24,26,.985) 91%,#17181a 100%)}' +
             '.capsule-trailer__hero-inner{position:absolute;z-index:2;left:2.35em;right:2.35em;bottom:1.9em;max-width:75em;margin:0 auto}' +
             '.capsule-trailer__title{font-size:2.3em;font-weight:600;line-height:1.04;letter-spacing:-.027em;max-width:19em;text-shadow:0 .08em .34em rgba(0,0,0,.42)}' +
@@ -1979,7 +2001,7 @@
             '@media(max-width:700px){' +
                 '.capsule-trailer__hero{height:20.2em}' +
                 '.capsule-trailer__backdrop{left:50%;top:1.35em;width:138%;max-width:none!important;height:calc(100% - 1.35em);object-position:50% 44%;transform:translateX(-50%)}' +
-                '.capsule-trailer__hero:before{background:linear-gradient(180deg,#17181a 0%,#17181a 7%,rgba(23,24,26,.94) 12%,rgba(23,24,26,.7) 19%,rgba(23,24,26,.34) 27%,rgba(23,24,26,.1) 35%,rgba(23,24,26,0) 44%),linear-gradient(90deg,rgba(23,24,26,.18) 0%,rgba(23,24,26,.012) 56%,rgba(23,24,26,.05) 100%)}' +
+                '.capsule-trailer__hero:before{top:0;height:7.2em;background:linear-gradient(0deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.1) 23%,rgba(23,24,26,.38) 48%,rgba(23,24,26,.76) 73%,#17181a 100%),linear-gradient(90deg,rgba(23,24,26,.16) 0%,rgba(23,24,26,.012) 56%,rgba(23,24,26,.05) 100%)}' +
                 '.capsule-trailer__hero:after{top:38%;background:linear-gradient(180deg,rgba(23,24,26,0) 0%,rgba(23,24,26,.03) 8%,rgba(23,24,26,.13) 22%,rgba(23,24,26,.38) 42%,rgba(23,24,26,.72) 63%,rgba(23,24,26,.92) 79%,rgba(23,24,26,.992) 92%,#17181a 100%)}' +
                 '.capsule-trailer__hero-inner{left:1.22em;right:1.22em;bottom:.82em}' +
                 '.capsule-trailer__title{font-size:1.72em;max-width:14em}' +
@@ -2125,7 +2147,7 @@
                 '<img class="capsule-trailer__thumb" src="' + escapeHtml(item.thumbnail) + '" />' :
                 '<div class="capsule-trailer__thumb capsule-trailer__thumb--empty">' + ICON + '</div>';
             var el = $(
-                '<div class="capsule-trailer__item selector" data-score="' + escapeHtml(item.score || 0) + '" data-provider="' + escapeHtml(provider && provider.id || item.provider || '') + '">' +
+                '<div class="capsule-trailer__item selector" data-score="' + escapeHtml(item.score || 0) + '" data-provider="' + escapeHtml(provider && provider.id || item.provider || '') + '" data-year-exact="' + (titleHasMovieYear(item, movie) ? '1' : '0') + '">' +
                     thumb +
                     '<div class="capsule-trailer__meta">' +
                         '<div class="capsule-trailer__topline">' +
@@ -2393,10 +2415,25 @@
             refreshCollection(retryButton);
         }
 
+        function applyMovieYearPreference() {
+            var rows = resultRoot.children('.capsule-trailer__item');
+            if (!rows.length) return;
+
+            var exact = rows.filter('[data-year-exact="1"]');
+            if (!exact.length) return;
+
+            rows.filter('[data-year-exact!="1"]').remove();
+            totalResults = exact.length;
+
+            if (last && last.closest && !last.closest(document.documentElement).length) last = null;
+            rebuildSourceFilters();
+        }
+
         function searchFinished() {
             if (!alive) return;
             loading.addClass('hide');
             self.activity.loader(false);
+            applyMovieYearPreference();
             sortResults();
             if (totalResults) {
                 rebuildSourceFilters();
