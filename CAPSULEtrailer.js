@@ -22,15 +22,16 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.4.0';
+    var VERSION = '2.5.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v6';
+    var CACHE_KEY = 'capsule_trailer_cache_v7';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
     var RESOLVE_TIMEOUT = 7000;
     var AUTO_SCORE_MIN = 260;
     var AUTO_SETTLE_MS = 420;
+    var AUTO_SEARCH_MAX_MS = 1800;
     var jsonpSerial = 0;
 
     var ICON = '' +
@@ -617,6 +618,7 @@
         id: 'direct',
         name: 'Lampa direct',
         tier: 'stable',
+        autoplay: true,
         search: function (context, done) {
             done(null, normalizeNativeVideos(context.videos, context.movie));
             return function () {};
@@ -782,6 +784,7 @@
         if (widget.indexOf('onlyPlayer=') < 0) widget += (widget.indexOf('?') >= 0 ? '&' : '?') + 'onlyPlayer=1';
         if (widget.indexOf('autoplay=') < 0) widget += '&autoplay=1';
         if (widget.indexOf('cover=') < 0) widget += '&cover=1';
+        if (widget.indexOf('tv=') < 0) widget += '&tv=1';
 
         return widget;
     }
@@ -808,6 +811,7 @@
         id: 'kinopoisk',
         name: 'Кинопоиск',
         tier: 'experimental',
+        autoplay: false,
         search: function (context, done) {
             if (!settingEnabled('capsule_trailer_kinopoisk', true) || !kinopoiskApiKey()) {
                 done(null, []);
@@ -1083,6 +1087,7 @@
         id: 'ok',
         name: 'OK',
         tier: 'experimental',
+        autoplay: true,
         search: function (context, done) {
             var movie = context.movie || {};
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
@@ -1148,6 +1153,184 @@
     };
 
     var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, OkProvider];
+
+    function closeSourceSelectionState() {
+        try {
+            if (Lampa.Select && Lampa.Select.opened && Lampa.Select.opened()) Lampa.Select.close();
+        }
+        catch (e) {}
+
+        try {
+            if (Lampa.Activity && typeof Lampa.Activity.mixState === 'function') Lampa.Activity.mixState();
+        }
+        catch (e2) {}
+
+        try { Lampa.Controller.toggle('content'); } catch (e3) {}
+    }
+
+    function collectAutoplayCandidates(context, done) {
+        var active = true;
+        var finished = false;
+        var cancels = [];
+        var providers = [];
+        var pending = 0;
+        var candidates = {};
+        var timer = null;
+
+        for (var p = 0; p < PROVIDERS.length; p++) {
+            if (PROVIDERS[p].autoplay !== false) providers.push(PROVIDERS[p]);
+        }
+
+        pending = providers.length;
+
+        function finish() {
+            if (!active || finished) return;
+            finished = true;
+            clearTimeout(timer);
+
+            for (var i = 0; i < cancels.length; i++) {
+                try { cancels[i](); } catch (e) {}
+            }
+            cancels = [];
+
+            var result = [];
+            for (var key in candidates) {
+                if (Object.prototype.hasOwnProperty.call(candidates, key)) result.push(candidates[key]);
+            }
+
+            result.sort(function (a, b) {
+                return (b.item.score || 0) - (a.item.score || 0);
+            });
+
+            done(result);
+        }
+
+        function add(provider, items) {
+            items = items || [];
+            for (var i = 0; i < items.length; i++) {
+                var item = items[i];
+                item.score = scoreCandidate(item, context.movie, item.exactMovieMatch === true);
+                if (item.score < 0) continue;
+
+                var key = semanticTrailerKey(item) || item.canonical || item.id || (provider.id + ':' + i);
+                var current = candidates[key];
+                if (!current || item.score > current.item.score) {
+                    candidates[key] = { item: item, provider: provider };
+                }
+            }
+        }
+
+        function providerDone(provider, error, items) {
+            if (!active || finished) return;
+            if (!error) add(provider, items);
+            pending--;
+            if (pending <= 0) finish();
+        }
+
+        if (!pending) {
+            done([]);
+            return function () {};
+        }
+
+        timer = setTimeout(finish, AUTO_SEARCH_MAX_MS);
+
+        for (var i = 0; i < providers.length; i++) {
+            (function (provider) {
+                var called = false;
+                function complete(error, items) {
+                    if (called) return;
+                    called = true;
+                    providerDone(provider, error, items);
+                }
+
+                try {
+                    var cancel = provider.search(context, complete);
+                    if (typeof cancel === 'function') cancels.push(cancel);
+                }
+                catch (e) {
+                    complete(e, []);
+                }
+            })(providers[i]);
+        }
+
+        return function () {
+            active = false;
+            clearTimeout(timer);
+            for (var i = 0; i < cancels.length; i++) {
+                try { cancels[i](); } catch (e) {}
+            }
+            cancels = [];
+        };
+    }
+
+    function startBestTrailer(context, done) {
+        var cancelled = false;
+        var searchCancel = collectAutoplayCandidates(context, function (results) {
+            if (cancelled) return;
+
+            if (!results.length || !results[0].item || results[0].item.score < AUTO_SCORE_MIN) {
+                done(false);
+                return;
+            }
+
+            var index = 0;
+            var resolveCancel = null;
+
+            function next() {
+                if (cancelled) return;
+
+                if (index >= results.length) {
+                    done(false);
+                    return;
+                }
+
+                var selected = results[index++];
+                if (!selected || !selected.provider || typeof selected.provider.resolve !== 'function') {
+                    next();
+                    return;
+                }
+
+                if (selected.item.score < AUTO_SCORE_MIN) {
+                    done(false);
+                    return;
+                }
+
+                var settled = false;
+                var currentCancel = selected.provider.resolve(selected.item, context, function (error, data) {
+                    settled = true;
+                    resolveCancel = null;
+                    if (cancelled) return;
+
+                    if (error || !data || !data.url) {
+                        next();
+                        return;
+                    }
+
+                    closeSourceSelectionState();
+
+                    try {
+                        Lampa.Player.play(data);
+                        done(true);
+                    }
+                    catch (e) {
+                        log('autoplay Player.play error', e);
+                        next();
+                    }
+                });
+
+                resolveCancel = settled ? null : (typeof currentCancel === 'function' ? currentCancel : null);
+            }
+
+            next();
+        });
+
+        return function () {
+            cancelled = true;
+            if (searchCancel) {
+                try { searchCancel(); } catch (e) {}
+            }
+        };
+    }
 
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
@@ -1308,16 +1491,39 @@
                     frame.style.border = '0';
                     frame.style.display = 'block';
                     frame.style.pointerEvents = 'none';
+
+                    frame.onload = function () {
+                        if (!frame) return;
+
+                        if (!ready) {
+                            ready = true;
+                            listener.send('canplay');
+                            listener.send('loadeddata');
+                        }
+
+                        post('setVolume', { volume: muted ? 0 : volume });
+
+                        if (wantedPlay) {
+                            paused = false;
+                            post('play');
+                            listener.send('playing');
+                        }
+                    };
+
                     object.empty().append(frame);
 
                     initTimer = setTimeout(function () {
                         if (ready || !frame) return;
-                        video.error = {
-                            code: 'kinopoisk-widget-timeout',
-                            message: 'Kinopoisk widget did not initialize'
-                        };
-                        listener.send('error', { error: video.error, fatal: true });
-                    }, 12000);
+                        ready = true;
+                        listener.send('canplay');
+                        listener.send('loadeddata');
+
+                        if (wantedPlay) {
+                            paused = false;
+                            post('play');
+                            listener.send('playing');
+                        }
+                    }, 2500);
                 }
 
                 Object.defineProperty(video, 'src', {
@@ -1380,7 +1586,11 @@
                 };
                 video.play = function () {
                     wantedPlay = true;
-                    if (ready) post('play');
+                    if (ready) {
+                        paused = false;
+                        post('play');
+                        listener.send('playing');
+                    }
                 };
                 video.pause = function () {
                     wantedPlay = false;
@@ -1475,6 +1685,14 @@
                                 catch (e2) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
                             }, 100);
                         }, 0);
+                        return;
+                    }
+
+                    if (data.capsule_source === 'kinopoisk-widget') {
+                        used = true;
+                        cleanup();
+                        Lampa.Noty.show('CAPSULE Trailer: Кинопоиск не смог запустить виджет');
+                        closePlayer();
                         return;
                     }
 
@@ -1663,14 +1881,7 @@
         }
 
         function scheduleAutoPlay() {
-            if (!settingEnabled('capsule_trailer_autoplay', false) || autoStarted || !bestFound || bestFound.item.score < AUTO_SCORE_MIN) return;
-            clearTimeout(autoTimer);
-            autoTimer = setTimeout(function () {
-                if (!alive || autoStarted || !bestFound || bestFound.item.score < AUTO_SCORE_MIN) return;
-                autoStarted = true;
-                status.text('Лучший трейлер найден · запуск…');
-                play(bestFound.item, bestFound.provider);
-            }, AUTO_SETTLE_MS);
+            return;
         }
 
         function appendResults(provider, items) {
@@ -1936,7 +2147,7 @@
             },
             field: {
                 name: 'Автоматически запускать лучший трейлер',
-                description: 'Если CAPSULE уверен в совпадении, лучший найденный трейлер запускается автоматически. При сомнительном совпадении список останется на экране.'
+                description: 'CAPSULE сначала завершает быстрый поиск, сравнивает результаты по score и запускает лучший без открытия списка. Экспериментальный Кинопоиск в автостарт не участвует.'
             }
         });
 
@@ -2056,7 +2267,7 @@
             '</div>'
         );
 
-        button.on('hover:enter', function () {
+        function openTrailerList() {
             Lampa.Activity.push({
                 url: '',
                 title: 'Трейлеры',
@@ -2065,6 +2276,26 @@
                 movie: movie,
                 videos: event.data.videos || { results: [] },
                 capsule_version: VERSION
+            });
+        }
+
+        button.on('hover:enter', function () {
+            if (!settingEnabled('capsule_trailer_autoplay', false)) {
+                openTrailerList();
+                return;
+            }
+
+            if (button.data('capsule-autoplay-busy')) return;
+            button.data('capsule-autoplay-busy', true);
+
+            closeSourceSelectionState();
+
+            startBestTrailer({
+                movie: movie,
+                videos: event.data.videos || { results: [] }
+            }, function (started) {
+                button.data('capsule-autoplay-busy', false);
+                if (!started) openTrailerList();
             });
         });
 
