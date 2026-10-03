@@ -11,8 +11,7 @@
  * - Lampa.Player / Lampa.PlayerVideo.registerTube
  *
  * Discovery / playback layers:
- * - OK.ru is the primary trailer source.
- * - VK Video and Dzen are additional trailer sources.
+ * - OK.ru, VK Video and Dzen are stable trailer sources.
  *
  */
 (function () {
@@ -21,7 +20,7 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.9.0';
+    var VERSION = '3.10.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
     var CACHE_KEY = 'capsule_trailer_cache_v15';
@@ -874,6 +873,11 @@
         tier: 'stable',
         autoplay: true,
         search: function (context, done) {
+            if (!settingEnabled('capsule_trailer_ok', true)) {
+                done(null, []);
+                return function () {};
+            }
+
             var movie = context.movie || {};
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
             var original = movie.original_title || movie.original_name || '';
@@ -2527,7 +2531,7 @@
 
         Lampa.SettingsApi.addComponent({
             component: 'capsule_trailer_settings',
-            name: 'CAPSULEtrailer',
+            name: 'CAPSULE trailer',
             icon: ICON
         });
 
@@ -2542,7 +2546,7 @@
             param: {
                 name: 'capsule_trailer_autoplay',
                 type: 'trigger',
-                default: false
+                default: true
             },
             field: {
                 name: 'Сразу запускать лучший трейлер',
@@ -2569,7 +2573,7 @@
                 name: 'capsule_trailer_quality',
                 type: 'select',
                 values: {
-                    'best': 'Лучшее доступное',
+                    'best': 'Максимальное доступное',
                     '2160': '2160p',
                     '1440': '1440p',
                     '1080': '1080p',
@@ -2580,7 +2584,7 @@
             },
             field: {
                 name: 'Предпочитаемое качество',
-                description: 'Какое качество предпочитать при запуске. Если такого варианта нет, будет выбрано ближайшее доступное.'
+                description: 'По умолчанию выбирается максимальное доступное качество. При выборе конкретного значения используется ближайший доступный вариант.'
             }
         });
 
@@ -2592,13 +2596,14 @@
 
         Lampa.SettingsApi.addParam({
             component: 'capsule_trailer_settings',
-            param: { type: 'static' },
-            field: {
-                name: 'OK.ru — основной источник',
-                description: 'Основной источник CAPSULE Trailer. Всегда включён.'
+            param: {
+                name: 'capsule_trailer_ok',
+                type: 'trigger',
+                default: true
             },
-            onRender: function (item) {
-                item.removeClass('selector');
+            field: {
+                name: 'OK.ru',
+                description: 'Использовать трейлеры из OK.ru. Участвует в автоматическом выборе лучшего варианта.'
             }
         });
 
@@ -2664,7 +2669,7 @@
         }
 
         button.on('hover:enter', function () {
-            if (!settingEnabled('capsule_trailer_autoplay', false)) {
+            if (!settingEnabled('capsule_trailer_autoplay', true)) {
                 openTrailerList();
                 return;
             }
