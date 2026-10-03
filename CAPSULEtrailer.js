@@ -485,7 +485,10 @@
         if (!queue.length) return data;
 
         data.error = function (work, use) {
-            if (!queue.length) return;
+            if (!queue.length) {
+                work.capsule_retry_inflight_until = 0;
+                return;
+            }
             var next = queue.shift();
             work.url = next.url;
             work.capsule_retry_inflight_until = Date.now() + 1800;
