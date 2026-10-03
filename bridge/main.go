@@ -162,4 +162,4 @@ func (b *bridge) withCORS(next http.HandlerFunc) http.HandlerFunc {
 
 func (b *bridge) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAls
+		http.Error(w, "method not allowed", http.StatusMethodNotAll
