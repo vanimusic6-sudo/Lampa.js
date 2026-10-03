@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.20.0';
+    var VERSION = '3.21.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v20';
+    var CACHE_KEY = 'capsule_trailer_cache_v21';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -490,198 +490,8 @@
         return function () { finish(new Error('cancelled')); };
     }
 
-    function isAndroidNativeTransport() {
-        try {
-            return !!(Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android'));
-        }
-        catch (e) {
-            return false;
-        }
-    }
-
-    function isBrowserHttpTransport() {
-        if (isAndroidNativeTransport()) return false;
-        try {
-            return !!(window.location && /^(?:http|https):$/i.test(window.location.protocol || ''));
-        }
-        catch (e) {
-            return false;
-        }
-    }
-
-    function configuredBrowserProxy() {
-        var proxy = '';
-        try { proxy = String(Lampa.Storage.get('online_proxy_all') || ''); } catch (e) {}
-        proxy = proxy.replace(/^\s+|\s+$/g, '');
-        return proxy;
-    }
-
-    function configuredProxyUrl(proxy, target) {
-        proxy = String(proxy || '');
-        target = String(target || '');
-        if (!proxy || !target) return '';
-
-        if (proxy.indexOf('{url}') >= 0) {
-            return proxy.replace('{url}', encodeURIComponent(target));
-        }
-
-        if (/[?&](?:url|target)=$/i.test(proxy)) {
-            return proxy + encodeURIComponent(target);
-        }
-
-        if (proxy.charAt(proxy.length - 1) !== '/') proxy += '/';
-        return proxy + target;
-    }
-
-    function browserProxyCandidates(url) {
-        var out = [];
-        var seen = {};
-        var configured = configuredBrowserProxy();
-
-        function add(candidate, kind) {
-            candidate = String(candidate || '');
-            if (!candidate || seen[candidate]) return;
-            seen[candidate] = true;
-            out.push({ url: candidate, kind: kind });
-        }
-
-        if (configured) add(configuredProxyUrl(configured, url), 'configured');
-
-        // Browser Lampa cannot use Android's native HTTP transport. Prefer a
-        // current keyless GET bridge and keep AllOrigins as a second fallback.
-        add('https://proxy.cors.dev/' + url, 'cors.dev');
-        add('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 'allorigins');
-
-        return out;
-    }
-
-    function browserProxyGet(url, dataType, timeout, done) {
-        if (!isBrowserHttpTransport()) {
-            done(new Error('browser-proxy-unavailable'));
-            return function () {};
-        }
-
-        var candidates = browserProxyCandidates(url);
-        var index = 0;
-        var active = true;
-        var current = null;
-
-        function stopCurrent() {
-            if (!current) return;
-            try { current.clear(); } catch (e) {}
-            current = null;
-        }
-
-        function next() {
-            if (!active) return;
-            stopCurrent();
-
-            if (index >= candidates.length) {
-                done(new Error('browser-proxy-network'));
-                return;
-            }
-
-            var candidate = candidates[index++];
-            var network = new Lampa.Reguest();
-            current = network;
-            network.timeout(timeout || SEARCH_TIMEOUT);
-
-            try {
-                network.silent(candidate.url, function (data) {
-                    if (!active || current !== network) return;
-                    current = null;
-
-                    if (dataType === 'json') {
-                        var parsed = parseMaybeJson(data);
-                        if (!parsed) {
-                            next();
-                            return;
-                        }
-                        data = parsed;
-                    }
-
-                    log('browser transport fallback', candidate.kind);
-                    done(null, data);
-                }, function () {
-                    if (!active || current !== network) return;
-                    log('browser transport failed', candidate.kind, url);
-                    current = null;
-                    next();
-                }, false, {
-                    timeout: timeout || SEARCH_TIMEOUT,
-                    dataType: 'text'
-                });
-            }
-            catch (e) {
-                current = null;
-                next();
-            }
-        }
-
-        next();
-
-        return function () {
-            active = false;
-            stopCurrent();
-        };
-    }
-
-    function browserProxyPost(url, dataType, timeout, postData, done) {
-        if (!isBrowserHttpTransport()) {
-            done(new Error('browser-proxy-unavailable'));
-            return function () {};
-        }
-
-        var proxy = configuredBrowserProxy();
-        if (!proxy) {
-            done(new Error('browser-post-proxy-unavailable'));
-            return function () {};
-        }
-
-        var target = configuredProxyUrl(proxy, url);
-        var network = new Lampa.Reguest();
-        var active = true;
-        network.timeout(timeout || SEARCH_TIMEOUT);
-
-        try {
-            network.silent(target, function (data) {
-                if (!active) return;
-
-                if (dataType === 'json') {
-                    data = parseMaybeJson(data);
-                    if (!data) {
-                        done(new Error('browser-post-proxy-json'));
-                        return;
-                    }
-                }
-
-                log('browser POST transport fallback', 'configured');
-                done(null, data);
-            }, function () {
-                if (!active) return;
-                done(new Error('browser-post-proxy-network'));
-            }, postData || '', {
-                timeout: timeout || SEARCH_TIMEOUT,
-                dataType: 'text',
-                headers: {
-                    'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json',
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-                }
-            });
-        }
-        catch (e) {
-            done(e);
-        }
-
-        return function () {
-            active = false;
-            try { network.clear(); } catch (e) {}
-        };
-    }
-
     function requestData(url, dataType, timeout, done, extraHeaders) {
         var network = new Lampa.Reguest();
-        var proxyCancel = null;
         var finished = false;
         var headers = { 'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json' };
         network.timeout(timeout || SEARCH_TIMEOUT);
@@ -692,76 +502,32 @@
             }
         }
 
-        if (isBrowserHttpTransport()) {
-            delete headers['User-Agent'];
-            delete headers['user-agent'];
-            delete headers.Referer;
-            delete headers.referer;
-            delete headers.Origin;
-            delete headers.origin;
-            delete headers.Host;
-            delete headers.host;
-        }
-
         function finish(error, data) {
             if (finished) return;
             finished = true;
             try { network.clear(); } catch (e) {}
-            if (proxyCancel) {
-                try { proxyCancel(); } catch (e2) {}
-                proxyCancel = null;
-            }
             if (!error && dataType === 'json') data = parseMaybeJson(data);
             done(error, data);
-        }
-
-        function failDirect() {
-            if (!isBrowserHttpTransport()) {
-                finish(new Error('network'));
-                return;
-            }
-
-            proxyCancel = browserProxyGet(url, dataType, timeout, function (proxyError, data) {
-                if (proxyError) finish(new Error('network'));
-                else finish(null, data);
-            });
-        }
-
-        // In a normal desktop browser the direct cross-origin request is known
-        // to be the wrong transport. Do not waste the whole timeout before the
-        // browser-safe path.
-        if (isBrowserHttpTransport()) {
-            failDirect();
-            return function () {
-                finished = true;
-                if (proxyCancel) {
-                    try { proxyCancel(); } catch (e) {}
-                    proxyCancel = null;
-                }
-            };
         }
 
         try {
             network.native(url, function (data) {
                 finish(null, data);
-            }, failDirect, false, {
+            }, function () {
+                finish(new Error('network'));
+            }, false, {
                 timeout: timeout || SEARCH_TIMEOUT,
                 dataType: dataType,
                 headers: headers
             });
         }
         catch (e) {
-            if (isBrowserHttpTransport()) failDirect();
-            else finish(e);
+            finish(e);
         }
 
         return function () {
             finished = true;
             try { network.clear(); } catch (e) {}
-            if (proxyCancel) {
-                try { proxyCancel(); } catch (e2) {}
-                proxyCancel = null;
-            }
         };
     }
 
@@ -775,7 +541,6 @@
 
     function postRequest(url, dataType, timeout, postData, done) {
         var network = new Lampa.Reguest();
-        var proxyCancel = null;
         var finished = false;
         network.timeout(timeout || SEARCH_TIMEOUT);
 
@@ -783,30 +548,16 @@
             if (finished) return;
             finished = true;
             try { network.clear(); } catch (e) {}
-            if (proxyCancel) {
-                try { proxyCancel(); } catch (e2) {}
-                proxyCancel = null;
-            }
             if (!error && dataType === 'json') data = parseMaybeJson(data);
             done(error, data);
-        }
-
-        function failDirect() {
-            if (!isBrowserHttpTransport()) {
-                finish(new Error('network'));
-                return;
-            }
-
-            proxyCancel = browserProxyPost(url, dataType, timeout, postData, function (proxyError, data) {
-                if (proxyError) finish(new Error('network'));
-                else finish(null, data);
-            });
         }
 
         try {
             network.native(url, function (data) {
                 finish(null, data);
-            }, failDirect, postData || '', {
+            }, function () {
+                finish(new Error('network'));
+            }, postData || '', {
                 timeout: timeout || SEARCH_TIMEOUT,
                 dataType: dataType,
                 headers: {
@@ -816,29 +567,13 @@
             });
         }
         catch (e) {
-            if (isBrowserHttpTransport()) failDirect();
-            else finish(e);
+            finish(e);
         }
 
         return function () {
             finished = true;
             try { network.clear(); } catch (e) {}
-            if (proxyCancel) {
-                try { proxyCancel(); } catch (e2) {}
-                proxyCancel = null;
-            }
         };
-    }
-
-    function browserCanNativeHls() {
-        if (!isBrowserHttpTransport()) return false;
-        try {
-            var probe = document.createElement('video');
-            return !!(probe && probe.canPlayType && probe.canPlayType('application/vnd.apple.mpegurl'));
-        }
-        catch (e) {
-            return false;
-        }
     }
 
     function directMediaUrl(url) {
@@ -854,8 +589,6 @@
     }
 
     function playbackHeaders(source) {
-        if (isBrowserHttpTransport()) return null;
-
         var headers = { 'User-Agent': 'Mozilla/5.0' };
         if (source === 'ok') headers.Referer = 'https://ok.ru/';
         else if (source === 'vk') headers.Referer = 'https://vkvideo.ru/';
@@ -1041,31 +774,8 @@
         if (metadataUrl.indexOf('//') === 0) metadataUrl = 'https:' + metadataUrl;
         else if (metadataUrl.charAt(0) === '/') metadataUrl = 'https://ok.ru' + metadataUrl;
         if (!/^https?:\/\//i.test(metadataUrl)) return done(new Error('ok-metadata-url'));
-
         var body = flashvars.location ? 'st.location=' + encodeURIComponent(flashvars.location) : 'st.location=';
-        var active = true;
-        var cancelCurrent = null;
-
-        if (isBrowserHttpTransport()) {
-            var getUrl = metadataUrl + (metadataUrl.indexOf('?') >= 0 ? '&' : '?') + body;
-            cancelCurrent = nativeRequest(getUrl, RESOLVE_TIMEOUT, function (getError, getData) {
-                if (!active) return;
-                done(getError, getData);
-            });
-        }
-        else {
-            cancelCurrent = postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, function (error, data) {
-                if (!active) return;
-                done(error, data);
-            });
-        }
-
-        return function () {
-            active = false;
-            if (cancelCurrent) {
-                try { cancelCurrent(); } catch (e3) {}
-            }
-        };
+        return postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, done);
     }
 
     function resolveOk(item, context, done) {
@@ -1108,8 +818,7 @@
                 var selectedType = 'direct';
                 var hls = metadata.hlsManifestUrl || metadata.ondemandHls || '';
 
-                if ((!selected || !selected.url) && hls && /^https?:\/\//i.test(hls) &&
-                    (!isBrowserHttpTransport() || browserCanNativeHls())) {
+                if ((!selected || !selected.url) && hls && /^https?:\/\//i.test(hls)) {
                     selected = { url: hls, height: 0 };
                     selectedType = 'hls';
                 }
@@ -1267,25 +976,6 @@
         return { width: width, height: height };
     }
 
-    function dzenEmbedUrl(raw, video) {
-        raw = raw || {};
-        video = video || {};
-        var values = [
-            raw.embedUrl, raw.embed_url, raw.embed,
-            raw.playerUrl, raw.player_url,
-            video.embedUrl, video.embed_url, video.embed,
-            video.playerUrl, video.player_url
-        ];
-
-        for (var i = 0; i < values.length; i++) {
-            var value = String(values[i] || '');
-            var match = value.match(/https?:\/\/dzen\.ru\/embed\/[0-9a-z_-]+/i);
-            if (match) return match[0];
-        }
-
-        return '';
-    }
-
     function normalizeDzenSearch(data, movie) {
         var feed = data && (data.feedData || data);
         var rows = feed && feed.items;
@@ -1318,7 +1008,6 @@
                 official: /официальн|official/i.test(title),
                 dzenId: id,
                 dzenVideo: video,
-                dzenEmbed: dzenEmbedUrl(raw, video),
                 url: 'https://dzen.ru/video/watch/' + id,
                 transportScore: 66,
                 exactMovieMatch: false
@@ -1377,8 +1066,6 @@
             var durationMatch = card.match(/aria-label=["']Общая длительность видео["'][^>]*>([^<]+)/i);
             var thumbnailMatch = card.match(/background-image\s*:\s*url\(([^)]+)\)/i);
             var thumbnail = thumbnailMatch ? String(thumbnailMatch[1] || '').replace(/^["']|["']$/g, '') : '';
-            var embedMatch = card.match(/https?:\\?\/\\?\/dzen\.ru\\?\/embed\\?\/[0-9a-z_-]+/i);
-            var embedUrl = embedMatch ? String(embedMatch[0] || '').replace(/\\\//g, '/') : '';
 
             var item = {
                 id: 'dzen:' + id,
@@ -1396,7 +1083,6 @@
                 kind: trailerKind(title),
                 official: /официальн|official/i.test(title),
                 dzenId: id,
-                dzenEmbed: embedUrl,
                 url: marker + id,
                 transportScore: 62,
                 exactMovieMatch: false
@@ -1495,16 +1181,14 @@
         var selected = pickPreferredStream(groups.direct);
 
         if (selected) type = 'direct';
-        else if (!isBrowserHttpTransport() || browserCanNativeHls()) {
+        else {
             selected = pickPreferredStream(groups.hls);
             if (selected) type = 'hls';
-            else if (!isBrowserHttpTransport()) {
+            else {
                 selected = pickPreferredStream(groups.dash);
                 if (selected) type = 'dash';
             }
         }
-
-        log('dzen streams', 'direct=' + groups.direct.length, 'hls=' + groups.hls.length, 'dash=' + groups.dash.length, 'selected=' + type);
 
         if (!selected || !selected.url) {
             done(new Error('dzen-stream'));
@@ -1704,7 +1388,6 @@
                 kind: trailerKind(title),
                 official: /официальн|official/i.test(title),
                 vkId: videoId,
-                vkEmbed: String(video.player || ''),
                 url: 'https://vkvideo.ru/video' + videoId,
                 transportScore: 72,
                 exactMovieMatch: false
@@ -1720,197 +1403,6 @@
         return out.slice(0, 5);
     }
 
-    function decodeJsonFragment(value) {
-        try { return JSON.parse('"' + String(value || '') + '"'); }
-        catch (e) { return String(value || '').replace(/\\\//g, '/'); }
-    }
-
-    function stripHtmlText(value) {
-        return decodeHtmlEntities(String(value || '')
-            .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
-            .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
-            .replace(/<[^>]+>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .replace(/^\s+|\s+$/g, ''));
-    }
-
-    function nearestVkStringField(text, at, names, radius) {
-        var start = Math.max(0, at - (radius || 3000));
-        var end = Math.min(text.length, at + (radius || 3000));
-        var chunk = text.slice(start, end);
-        var best = '';
-        var distance = 999999;
-
-        for (var n = 0; n < names.length; n++) {
-            var escaped = String(names[n]).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
-            var re = new RegExp('"' + escaped + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', 'gi');
-            var match;
-
-            while ((match = re.exec(chunk))) {
-                var absolute = start + match.index;
-                var currentDistance = Math.abs(absolute - at);
-                if (currentDistance < distance) {
-                    distance = currentDistance;
-                    best = decodeJsonFragment(match[1]);
-                }
-            }
-        }
-
-        return decodeHtmlEntities(best);
-    }
-
-    function nearestVkNumberField(text, at, name, radius) {
-        var start = Math.max(0, at - (radius || 2400));
-        var end = Math.min(text.length, at + (radius || 2400));
-        var chunk = text.slice(start, end);
-        var escaped = String(name).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
-        var re = new RegExp('"' + escaped + '"\\s*:\\s*(\\d+)', 'gi');
-        var best = 0;
-        var distance = 999999;
-        var match;
-
-        while ((match = re.exec(chunk))) {
-            var absolute = start + match.index;
-            var currentDistance = Math.abs(absolute - at);
-            if (currentDistance < distance) {
-                distance = currentDistance;
-                best = parseInt(match[1], 10) || 0;
-            }
-        }
-
-        return best;
-    }
-
-    function normalizeVkPublicSearch(text, movie) {
-        text = decodeHtmlEntities(String(text || ''))
-            .replace(/\\u002f/gi, '/')
-            .replace(/\\\//g, '/');
-
-        var out = [];
-        var seen = {};
-        var re = /video(-?\d+)_(\d+)/gi;
-        var match;
-
-        while ((match = re.exec(text)) && out.length < 12) {
-            var videoId = match[1] + '_' + match[2];
-            if (seen[videoId]) continue;
-            seen[videoId] = true;
-
-            var at = match.index;
-            var title = nearestVkStringField(text, at, ['title', 'name'], 2600);
-
-            if (!title) {
-                var start = Math.max(0, at - 1800);
-                var end = Math.min(text.length, at + 1800);
-                var chunk = text.slice(start, end);
-                var anchor = chunk.match(/<a\b[^>]*(?:title|aria-label)=["']([^"']+)["'][^>]*>/i);
-                if (anchor) title = stripHtmlText(anchor[1]);
-            }
-
-            title = stripHtmlText(title);
-            if (!title || title.length > 320) continue;
-
-            var thumbnail = nearestVkStringField(text, at, [
-                'photo_1280', 'photo_800', 'photo_640', 'first_frame_1280',
-                'first_frame_800', 'first_frame_640', 'image'
-            ], 3200);
-            var duration = nearestVkNumberField(text, at, 'duration', 2600);
-            var player = nearestVkStringField(text, at, ['player', 'player_url', 'playerUrl'], 4600);
-            if (/^\/\//.test(player)) player = 'https:' + player;
-            if (!/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(player)) player = '';
-
-            var item = {
-                id: 'vk:' + videoId,
-                canonical: 'vk:' + videoId,
-                provider: 'vk',
-                providerName: 'VK Video',
-                title: title,
-                description: '',
-                duration: duration,
-                thumbnail: thumbnail,
-                author: '',
-                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
-                qualityHint: '',
-                year: '',
-                kind: trailerKind(title),
-                official: /официальн|official/i.test(title),
-                vkId: videoId,
-                vkEmbed: player,
-                url: 'https://vkvideo.ru/video' + videoId,
-                transportScore: 62,
-                exactMovieMatch: false
-            };
-
-            item.score = scoreCandidate(item, movie, false);
-            if (item.score >= 0) out.push(item);
-        }
-
-        out = dedupeCandidates(out);
-        return out.slice(0, 5);
-    }
-
-    function vkFilesFromHtml(text) {
-        text = decodeHtmlEntities(String(text || ''))
-            .replace(/\\u002f/gi, '/');
-
-        var marker = '"files"';
-        var cursor = 0;
-
-        while (cursor < text.length) {
-            var at = text.indexOf(marker, cursor);
-            if (at < 0) break;
-            var start = text.indexOf('{', at + marker.length);
-            if (start < 0 || start - at > 120) {
-                cursor = at + marker.length;
-                continue;
-            }
-
-            var json = jsonObjectAt(text, start);
-            if (json) {
-                try {
-                    var files = JSON.parse(json);
-                    if (files && typeof files === 'object') return files;
-                }
-                catch (e) {}
-            }
-
-            cursor = start + 1;
-        }
-
-        var fallback = {};
-        var re = /"(mp4_\d+|url\d+|cache\d+|hls(?:_[^"]*)?|dash(?:_[^"]*)?)"\s*:\s*"((?:\\.|[^"\\])*)"/gi;
-        var match;
-        while ((match = re.exec(text))) {
-            var value = decodeJsonFragment(match[2]);
-            if (/^\/\//.test(value)) value = 'https:' + value;
-            if (/^https?:\/\//i.test(value)) fallback[match[1]] = value;
-        }
-
-        return Object.keys(fallback).length ? fallback : null;
-    }
-
-    function resolveVkPublic(item, context, done) {
-        var parts = String(item.vkId || '').match(/^(-?\d+)_(\d+)$/);
-        if (!parts) {
-            done(new Error('vk-public-id'));
-            return function () {};
-        }
-
-        var url = String(item.vkEmbed || '');
-        if (/^\/\//.test(url)) url = 'https:' + url;
-        if (!/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(url)) {
-            url = 'https://vkvideo.ru/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
-                '&id=' + encodeURIComponent(parts[2]) + '&hd=2';
-        }
-
-        return textRequest(url, 6500, function (error, text) {
-            if (error || !text) return done(error || new Error('vk-public-page'));
-            var files = vkFilesFromHtml(text);
-            if (!files) return done(new Error('vk-public-files'));
-            finishVkResolve(files, item, context, done);
-        });
-    }
-
     function vkStreamGroups(files) {
         files = files || {};
         var direct = [];
@@ -1923,7 +1415,7 @@
             if (/^\/\//.test(url)) url = 'https:' + url;
             if (!/^https?:\/\//i.test(url)) continue;
 
-            var directMatch = String(key).match(/^(?:mp4_|url|cache)(\d+)$/);
+            var directMatch = String(key).match(/^mp4_(\d+)$/);
             if (directMatch) {
                 direct.push({ url: url, height: parseInt(directMatch[1], 10) || 0 });
                 continue;
@@ -1936,70 +1428,7 @@
         return { direct: direct, hls: hls, dash: dash };
     }
 
-    function finishVkResolve(files, item, context, done) {
-        var groups = vkStreamGroups(files);
-
-        if (!groups.direct.length && !groups.hls.length && !groups.dash.length) {
-            done(new Error('vk-stream'));
-            return;
-        }
-
-        var type = '';
-        var selected = pickPreferredStream(groups.direct);
-        if (selected) type = 'direct';
-        else if (!isBrowserHttpTransport() || browserCanNativeHls()) {
-            selected = pickPreferredStream(groups.hls);
-            if (selected) type = 'hls';
-            else if (!isBrowserHttpTransport()) {
-                selected = pickPreferredStream(groups.dash);
-                if (selected) type = 'dash';
-            }
-        }
-
-        log('vk streams', 'direct=' + groups.direct.length, 'hls=' + groups.hls.length, 'dash=' + groups.dash.length, 'selected=' + type);
-
-        if (!selected || !selected.url) {
-            done(new Error('vk-stream'));
-            return;
-        }
-
-        var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
-            (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
-        var result = {
-            url: playUrl,
-            title: item.title,
-            card: context.movie,
-            capsule_trailer: true,
-            capsule_source: type === 'direct' ? 'vk-direct' : 'vk-' + type,
-            headers: playbackHeaders('vk'),
-            hls_manifest_timeout: 12000
-        };
-        if (type === 'hls') result.hls_type = 'native';
-
-        var alternatives = [];
-        function addAlternatives(list, alternativeType) {
-            for (var ai = 0; ai < list.length; ai++) {
-                var stream = list[ai] || {};
-                if (!stream.url || stream.url === selected.url) continue;
-                alternatives.push({
-                    url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
-                        (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
-                    hls_type: alternativeType === 'hls' ? 'native' : '',
-                    headers: playbackHeaders('vk')
-                });
-            }
-        }
-        addAlternatives(groups.direct, 'direct');
-        addAlternatives(groups.hls, 'hls');
-        addAlternatives(groups.dash, 'dash');
-        attachAlternateStreams(result, alternatives);
-
-        done(null, result);
-    }
-
     function resolveVk(item, context, done) {
-        if (isBrowserHttpTransport()) return resolveVkPublic(item, context, done);
-
         var cancelled = false;
         var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
             if (cancelled) return;
@@ -2021,13 +1450,59 @@
 
                 var rows = data && data.response && data.response.items;
                 var video = Object.prototype.toString.call(rows) === '[object Array]' ? rows[0] : null;
+                var groups = vkStreamGroups(video && video.files);
 
-                if (error || !video || !video.files) {
+                if (error || !video || (!groups.direct.length && !groups.hls.length && !groups.dash.length)) {
                     done(error || new Error('vk-stream'));
                     return;
                 }
 
-                finishVkResolve(video.files, item, context, done);
+                var type = '';
+                var selected = pickPreferredStream(groups.direct);
+                if (selected) type = 'direct';
+                else {
+                    selected = pickPreferredStream(groups.hls);
+                    if (selected) type = 'hls';
+                    else {
+                        selected = pickPreferredStream(groups.dash);
+                        if (selected) type = 'dash';
+                    }
+                }
+
+                if (!selected || !selected.url) return done(new Error('vk-stream'));
+
+                var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+                    (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
+                var result = {
+                    url: playUrl,
+                    title: item.title,
+                    card: context.movie,
+                    capsule_trailer: true,
+                    capsule_source: type === 'direct' ? 'vk-direct' : 'vk-' + type,
+                    headers: playbackHeaders('vk'),
+                    hls_manifest_timeout: 12000
+                };
+                if (type === 'hls') result.hls_type = 'native';
+
+                var alternatives = [];
+                function addAlternatives(list, alternativeType) {
+                    for (var ai = 0; ai < list.length; ai++) {
+                        var stream = list[ai] || {};
+                        if (!stream.url || stream.url === selected.url) continue;
+                        alternatives.push({
+                            url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
+                                (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
+                            hls_type: alternativeType === 'hls' ? 'native' : '',
+                            headers: playbackHeaders('vk')
+                        });
+                    }
+                }
+                addAlternatives(groups.direct, 'direct');
+                addAlternatives(groups.hls, 'hls');
+                addAlternatives(groups.dash, 'dash');
+                attachAlternateStreams(result, alternatives);
+
+                done(null, result);
             });
         });
 
@@ -2052,17 +1527,6 @@
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
             var year = yearOf(movie);
             var query = [title, year, 'трейлер'].join(' ').replace(/\s+/g, ' ');
-
-            if (isBrowserHttpTransport()) {
-                var publicUrl = 'https://vk.com/video?q=' + encodeURIComponent(query);
-                return textRequest(publicUrl, 6500, function (error, text) {
-                    if (error || !text) return done(error || new Error('vk-public-search'), []);
-                    var items = normalizeVkPublicSearch(text, movie);
-                    if (!items.length) return done(new Error('vk-public-search-empty'), []);
-                    done(null, items);
-                });
-            }
-
             var cancelled = false;
             var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
                 if (cancelled) return;
@@ -2108,8 +1572,6 @@
 
         try { Lampa.Controller.toggle('content'); } catch (e3) {}
     }
-
-    
 
     function collectAutoplayCandidates(context, done) {
         var active = true;
@@ -2232,18 +1694,13 @@
                 }
 
                 var selected = results[index++];
-                if (!selected || !selected.provider) {
+                if (!selected || !selected.provider || typeof selected.provider.resolve !== 'function') {
                     next();
                     return;
                 }
 
                 if (selected.item.score < AUTO_SCORE_MIN) {
                     done(false);
-                    return;
-                }
-
-                if (typeof selected.provider.resolve !== 'function') {
-                    next();
                     return;
                 }
 
@@ -2286,12 +1743,6 @@
 
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
-
-        if (window.capsule_trailer_embed_tube && typeof Lampa.PlayerVideo.removeTube === 'function') {
-            try { Lampa.PlayerVideo.removeTube(window.capsule_trailer_embed_tube); } catch (e) {}
-            window.capsule_trailer_embed_tube = null;
-        }
-
         if (window.capsule_trailer_media_tube) return;
 
         var probe = document.createElement('video');
@@ -3011,9 +2462,7 @@
         }
 
         function play(item, provider) {
-            if (!alive || !provider) return;
-
-            if (typeof provider.resolve !== 'function') return;
+            if (!alive || !provider || typeof provider.resolve !== 'function') return;
             if (resolvingCancel) {
                 try { resolvingCancel(); } catch (e) {}
                 resolvingCancel = null;
