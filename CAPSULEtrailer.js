@@ -23,9 +23,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.1.0';
+    var VERSION = '2.2.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v3';
+    var CACHE_KEY = 'capsule_trailer_cache_v4';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -450,6 +450,57 @@
         return /^https?:\/\//i.test(String(url || '')) && /\.(?:m3u8|mpd|mp4|m4v)(?:[?#]|$)/i.test(String(url || ''));
     }
 
+    function capsuleMediaUrl(url, type) {
+        url = String(url || '');
+        if (!url) return '';
+        var hash = type === 'hls' ? 'capsule-hls' : 'capsule-direct';
+        var clean = url.replace(/#.*$/, '');
+        return clean + '#' + hash;
+    }
+
+    function playbackHeaders(source) {
+        var headers = { 'User-Agent': 'Mozilla/5.0' };
+        if (source === 'ok') headers.Referer = 'https://ok.ru/';
+        else if (source === 'yandex') headers.Referer = 'https://yandex.ru/';
+        else if (source === 'kinopoisk') headers.Referer = 'https://www.kinopoisk.ru/';
+        else if (source === 'rutube') headers.Referer = 'https://rutube.ru/';
+        return headers;
+    }
+
+    function attachAlternateStreams(data, alternatives) {
+        var queue = [];
+        var seen = {};
+        var current = String(data && data.url || '').replace(/#.*$/, '');
+        alternatives = alternatives || [];
+
+        for (var i = 0; i < alternatives.length; i++) {
+            var item = alternatives[i] || {};
+            var url = String(item.url || '');
+            var clean = url.replace(/#.*$/, '');
+            if (!url || clean === current || seen[clean]) continue;
+            seen[clean] = true;
+            queue.push(item);
+        }
+
+        if (!queue.length) return data;
+
+        data.error = function (work, use) {
+            if (!queue.length) return;
+            var next = queue.shift();
+            work.url = next.url;
+            work.capsule_retry_inflight_until = Date.now() + 1800;
+            work.capsule_retry_count = (parseInt(work.capsule_retry_count, 10) || 0) + 1;
+
+            if (next.hls_type) work.hls_type = next.hls_type;
+            else if (work.hls_type) delete work.hls_type;
+
+            if (next.headers) work.headers = next.headers;
+            use(next.url);
+        };
+
+        return data;
+    }
+
     function normalizeNativeVideos(videos, movie) {
         var out = [];
         if (!settingEnabled('capsule_trailer_direct', true)) return out;
@@ -727,15 +778,21 @@
             var stream = parseKinopoiskWidgetStream(text);
             if (!stream) return done(new Error('kinopoisk-stream'));
 
+            var streamType = /\.m3u8(?:[?#]|$)/i.test(stream) ? 'hls' :
+                (/\.mpd(?:[?#]|$)/i.test(stream) ? 'dash' : 'direct');
+            var playUrl = streamType === 'direct' ? capsuleMediaUrl(stream, 'direct') :
+                (streamType === 'hls' ? capsuleMediaUrl(stream, 'hls') : stream);
+
             var data = {
-                url: stream,
+                url: playUrl,
                 title: item.title,
                 card: context.movie,
                 capsule_trailer: true,
                 capsule_source: 'kinopoisk-widget',
+                headers: playbackHeaders('kinopoisk'),
                 hls_manifest_timeout: 15000
             };
-            if (/\.m3u8(?:[?#]|$)/i.test(stream)) data.hls_type = 'native';
+            if (streamType === 'hls') data.hls_type = 'native';
             done(null, data);
         }, {
             'Accept': 'text/html,*/*',
@@ -923,16 +980,38 @@
             }
             if (!selected || !selected.url) return done(new Error('yandex-no-stream'));
 
+            var selectedUrl = selectedType === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+                (selectedType === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
             var result = {
-                url: selected.url,
+                url: selectedUrl,
                 title: item.title,
                 card: context.movie,
                 capsule_trailer: true,
                 capsule_source: selectedType === 'direct' ? 'yandex-direct' : 'yandex-vh',
+                headers: playbackHeaders('yandex'),
                 hls_manifest_timeout: 15000
             };
 
             if (selectedType === 'hls') result.hls_type = 'native';
+
+            var alternates = [];
+            function addYandexAlternates(list, type) {
+                for (var ai = 0; ai < list.length; ai++) {
+                    var candidate = list[ai];
+                    if (!candidate || !candidate.url || candidate.url === selected.url) continue;
+                    alternates.push({
+                        url: type === 'direct' ? capsuleMediaUrl(candidate.url, 'direct') :
+                            (type === 'hls' ? capsuleMediaUrl(candidate.url, 'hls') : candidate.url),
+                        hls_type: type === 'hls' ? 'native' : '',
+                        headers: playbackHeaders('yandex')
+                    });
+                }
+            }
+            addYandexAlternates(direct, 'direct');
+            addYandexAlternates(hls, 'hls');
+            addYandexAlternates(dash, 'dash');
+            addYandexAlternates(other, 'other');
+            attachAlternateStreams(result, alternates);
 
             done(null, result);
         });
@@ -1194,16 +1273,37 @@
 
                 if (!selected || !selected.url) return done(new Error('ok-no-stream'));
 
+                var selectedUrl = selectedType === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+                    capsuleMediaUrl(selected.url, 'hls');
                 var result = {
-                    url: selected.url,
+                    url: selectedUrl,
                     title: item.title,
                     card: context.movie,
                     capsule_trailer: true,
                     capsule_source: selectedType === 'direct' ? 'ok-direct' : 'ok-hls',
+                    headers: playbackHeaders('ok'),
                     hls_manifest_timeout: 15000
                 };
 
                 if (selectedType === 'hls') result.hls_type = 'native';
+
+                var alternates = [];
+                for (var vi = 0; vi < direct.length; vi++) {
+                    if (!direct[vi] || !direct[vi].url || direct[vi].url === selected.url) continue;
+                    alternates.push({
+                        url: capsuleMediaUrl(direct[vi].url, 'direct'),
+                        hls_type: '',
+                        headers: playbackHeaders('ok')
+                    });
+                }
+                if (hls && /^https?:\/\//i.test(hls) && hls !== selected.url) {
+                    alternates.push({
+                        url: capsuleMediaUrl(hls, 'hls'),
+                        hls_type: 'native',
+                        headers: playbackHeaders('ok')
+                    });
+                }
+                attachAlternateStreams(result, alternates);
 
                 done(null, result);
             });
@@ -1418,6 +1518,7 @@
                         capsule_fallback: embedData.url,
                         capsule_fallback_source: 'rutube-embed',
                         hls_type: 'native',
+                        headers: playbackHeaders('rutube'),
                         hls_manifest_timeout: 15000
                     });
                 }
@@ -1428,6 +1529,41 @@
     };
 
     var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, YandexProvider, OkProvider, RutubeProvider];
+
+    function registerCapsuleMediaTube() {
+        if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
+        if (window.capsule_trailer_media_tube) return;
+
+        var probe = document.createElement('video');
+        var registration = {
+            name: 'CAPSULE MEDIA',
+            verify: function (src) {
+                src = String(src || '');
+                if (src.indexOf('#capsule-direct') >= 0) return true;
+                if (src.indexOf('#capsule-hls') >= 0) {
+                    try {
+                        return !!probe.canPlayType('application/vnd.apple.mpegurl');
+                    }
+                    catch (e) {
+                        return false;
+                    }
+                }
+                return false;
+            },
+            create: function (callVideo) {
+                var object = $('<video class="player-video__video" poster="./img/video_poster.png" playsinline></video>');
+                var video = object[0];
+                try { video.removeAttribute('crossorigin'); } catch (e) {}
+                try { video.setAttribute('preload', 'metadata'); } catch (e2) {}
+                callVideo(video);
+                return object;
+            }
+        };
+
+        if (Lampa.PlayerVideo.registerTube(registration)) {
+            window.capsule_trailer_media_tube = registration;
+        }
+    }
 
     function registerRutubeTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
@@ -1749,41 +1885,81 @@
 
             function onError(event) {
                 if (!active || used || !event || !event.fatal) return;
-                used = true;
 
-                if (!data.capsule_fallback) {
+                setTimeout(function () {
+                    if (!active || used) return;
+
+                    if (data.capsule_retry_inflight_until && Date.now() < data.capsule_retry_inflight_until) {
+                        return;
+                    }
+
+                    if (data.capsule_fallback) {
+                        used = true;
+                        var fallbackData = {
+                            url: data.capsule_fallback,
+                            title: data.title,
+                            card: data.card,
+                            capsule_trailer: true,
+                            capsule_source: data.capsule_fallback_source || 'fallback',
+                            headers: data.headers || null
+                        };
+
+                        cleanup();
+                        Lampa.Noty.show(
+                            data.capsule_fallback_source === 'rutube-embed' ?
+                                'Прямой поток RUTUBE недоступен, пробуем встроенный плеер' :
+                                'Прямой поток недоступен, пробуем резервный способ воспроизведения'
+                        );
+
+                        setTimeout(function () {
+                            try {
+                                if (Lampa.Player.opened && Lampa.Player.opened()) Lampa.Player.close();
+                            }
+                            catch (e) {}
+
+                            setTimeout(function () {
+                                try { Lampa.Player.play(fallbackData); }
+                                catch (e2) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
+                            }, 100);
+                        }, 0);
+                        return;
+                    }
+
+                    if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android') && !data.capsule_native_retry) {
+                        used = true;
+                        var nativeData = {
+                            url: data.url,
+                            title: data.title,
+                            card: data.card,
+                            capsule_trailer: true,
+                            capsule_source: data.capsule_source || 'capsule',
+                            capsule_native_retry: true,
+                            launch_player: 'android',
+                            headers: data.headers || null
+                        };
+
+                        cleanup();
+                        Lampa.Noty.show('Внутренний плеер не принял поток, пробуем Android-плеер');
+
+                        setTimeout(function () {
+                            try {
+                                if (Lampa.Player.opened && Lampa.Player.opened()) Lampa.Player.close();
+                            }
+                            catch (e3) {}
+
+                            setTimeout(function () {
+                                try { Lampa.Player.play(nativeData); }
+                                catch (e4) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
+                            }, 120);
+                        }, 0);
+                        return;
+                    }
+
+                    used = true;
                     cleanup();
                     Lampa.Noty.show('CAPSULE Trailer: этот поток недоступен, выберите другой вариант');
                     closePlayer();
-                    return;
-                }
-
-                var fallbackData = {
-                    url: data.capsule_fallback,
-                    title: data.title,
-                    card: data.card,
-                    capsule_trailer: true,
-                    capsule_source: data.capsule_fallback_source || 'fallback'
-                };
-
-                cleanup();
-                Lampa.Noty.show(
-                    data.capsule_fallback_source === 'rutube-embed' ?
-                        'Прямой поток RUTUBE недоступен, пробуем встроенный плеер' :
-                        'Прямой поток недоступен, пробуем резервный способ воспроизведения'
-                );
-
-                setTimeout(function () {
-                    try {
-                        if (Lampa.Player.opened && Lampa.Player.opened()) Lampa.Player.close();
-                    }
-                    catch (e) {}
-
-                    setTimeout(function () {
-                        try { Lampa.Player.play(fallbackData); }
-                        catch (e2) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
-                    }, 80);
-                }, 0);
+                }, 80);
             }
 
             Lampa.PlayerVideo.listener.follow('error', onError);
@@ -2192,6 +2368,7 @@
             param: {
                 name: 'capsule_trailer_kinopoisk_key',
                 type: 'input',
+                values: '',
                 default: ''
             },
             field: {
@@ -2279,6 +2456,7 @@
     function init() {
         addStyles();
         setupSettings();
+        registerCapsuleMediaTube();
         registerRutubeTube();
         registerPlaybackFallback();
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, TrailerComponent);
