@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.11.0';
+    var VERSION = '3.12.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v15';
+    var CACHE_KEY = 'capsule_trailer_cache_v16';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -2030,8 +2030,7 @@
         var failures = [];
         var cancels = [];
         var resolvingCancel = null;
-        var resultSeen = {};
-        var semanticSeen = {};
+        var stagedResults = [];
         var bestFound = null;
         var autoTimer = null;
         var autoStarted = false;
@@ -2278,78 +2277,100 @@
             return;
         }
 
-        function appendResults(provider, items) {
+        function stageResults(provider, items) {
             if (!alive || !items || !items.length) return;
-            loading.addClass('hide');
-            filterRoot.removeClass('hide');
+
             for (var i = 0; i < items.length; i++) {
                 var item = items[i];
                 item.score = scoreCandidate(item, movie, item.exactMovieMatch === true);
                 if (item.score < 0) continue;
 
+                stagedResults.push({
+                    item: item,
+                    provider: provider
+                });
+            }
+        }
+
+        function finalizeResults() {
+            var byKey = {};
+            var bySemantic = {};
+            var prepared = [];
+
+            for (var i = 0; i < stagedResults.length; i++) {
+                var entry = stagedResults[i];
+                var item = entry.item;
+                var provider = entry.provider;
                 var key = item.canonical || item.id || (provider.id + ':' + i + ':' + item.title);
-                if (resultSeen[key]) continue;
+
+                if (byKey[key]) {
+                    if ((byKey[key].item.score || 0) >= (item.score || 0)) continue;
+                    byKey[key].discarded = true;
+                }
 
                 var semanticBase = semanticTrailerKey(item);
                 var semantic = semanticBase ? provider.id + ':' + semanticBase : '';
-                var duplicate = semantic ? semanticSeen[semantic] : null;
-                if (duplicate && duplicate.score >= item.score) continue;
 
-                if (duplicate) {
-                    try { duplicate.el.remove(); } catch (e) {}
-                    if (duplicate.key) delete resultSeen[duplicate.key];
-                    totalResults = Math.max(0, totalResults - 1);
+                if (semantic && bySemantic[semantic]) {
+                    if ((bySemantic[semantic].item.score || 0) >= (item.score || 0)) continue;
+                    bySemantic[semantic].discarded = true;
                 }
 
-                resultSeen[key] = true;
-                var el = makeItem(item, provider);
-                resultRoot.append(el);
-                totalResults++;
+                var current = {
+                    item: item,
+                    provider: provider,
+                    key: key,
+                    semantic: semantic,
+                    discarded: false
+                };
 
-                if (semantic) semanticSeen[semantic] = { score: item.score, el: el, key: key };
-                if (!bestFound || item.score > bestFound.item.score) {
-                    bestFound = { item: item, provider: provider };
-                    scheduleAutoPlay();
-                }
-
-                refreshCollection(el);
+                byKey[key] = current;
+                if (semantic) bySemantic[semantic] = current;
+                prepared.push(current);
             }
-            rebuildSourceFilters();
-        }
 
-        function sortResults() {
-            var nodes = resultRoot.children('.capsule-trailer__item').get();
-            nodes.sort(function (a, b) {
-                return (parseInt($(b).attr('data-score'), 10) || 0) - (parseInt($(a).attr('data-score'), 10) || 0);
+            var compact = [];
+            for (var p = 0; p < prepared.length; p++) {
+                if (!prepared[p].discarded) compact.push(prepared[p]);
+            }
+
+            compact = preferMovieYear(compact, movie, function (entry) {
+                return entry && entry.item;
             });
-            for (var i = 0; i < nodes.length; i++) resultRoot.append(nodes[i]);
-            rebuildSourceFilters();
 
-            if (started && Lampa.Activity.own(self)) {
-                var enabled = Lampa.Controller.enabled();
-                if (enabled && enabled.name === NAV_CONTROLLER) {
-                    Lampa.Controller.collectionSet(scroll.render(), false, true);
+            compact.sort(function (a, b) {
+                return (b.item.score || 0) - (a.item.score || 0);
+            });
 
-                    if (last && last.length && last[0] && last[0].offsetParent !== null) {
-                        Lampa.Controller.collectionFocus(last, scroll.render(), true);
-                    }
-                }
+            resultRoot.empty();
+            totalResults = compact.length;
+            bestFound = compact.length ? {
+                item: compact[0].item,
+                provider: compact[0].provider
+            } : null;
+
+            for (var r = 0; r < compact.length; r++) {
+                resultRoot.append(makeItem(compact[r].item, compact[r].provider));
             }
+
+            rebuildSourceFilters();
         }
 
         function providerDone(provider, error, items) {
             if (!alive) return;
             if (error) failures.push(provider.id);
-            appendResults(provider, items || []);
+            stageResults(provider, items || []);
             pendingProviders--;
             if (pendingProviders <= 0) searchFinished();
-            else if (totalResults) status.text(totalResults + ' ' + (totalResults === 1 ? 'вариант' : (totalResults < 5 ? 'варианта' : 'вариантов')));
         }
 
         function runProviders() {
             if (!alive) return;
             pendingProviders = PROVIDERS.length;
-            status.text('Ищем трейлеры…');
+            status.text('Ищем лучшие варианты…');
+            loading.removeClass('hide');
+            filterRoot.addClass('hide');
+            resultRoot.empty();
 
             for (var i = 0; i < PROVIDERS.length; i++) {
                 (function (provider) {
@@ -2379,8 +2400,7 @@
             pendingProviders = 0;
             totalResults = 0;
             failures = [];
-            resultSeen = {};
-            semanticSeen = {};
+            stagedResults = [];
             bestFound = null;
             autoStarted = false;
             clearTimeout(autoTimer);
@@ -2405,37 +2425,35 @@
             var retryButton = $('<div class="capsule-trailer__retry selector">Повторить поиск</div>');
             retryButton.on('hover:focus', function () {
                 last = retryButton;
-                try { scroll.update(retryButton, true); } catch (e) {}
+                ensureVisible(retryButton);
             });
             retryButton.on('hover:enter', retry);
             resultRoot.append(retryButton);
             refreshCollection(retryButton);
         }
 
-        function applyMovieYearPreference() {
-            var rows = resultRoot.children('.capsule-trailer__item');
-            if (!rows.length) return;
-
-            var exact = rows.filter('[data-year-exact="1"]');
-            if (!exact.length) return;
-
-            rows.filter('[data-year-exact!="1"]').remove();
-            totalResults = exact.length;
-
-            if (last && last.closest && !last.closest(document.documentElement).length) last = null;
-            rebuildSourceFilters();
-        }
-
         function searchFinished() {
             if (!alive) return;
+
+            finalizeResults();
             loading.addClass('hide');
             self.activity.loader(false);
-            applyMovieYearPreference();
-            sortResults();
+
             if (totalResults) {
-                rebuildSourceFilters();
+                filterRoot.removeClass('hide');
                 updateStatusForFilter();
                 scheduleAutoPlay();
+
+                if (started && Lampa.Activity.own(self)) {
+                    try {
+                        Lampa.Controller.collectionSet(scroll.render(), false, true);
+                        if (!last) {
+                            var first = resultRoot.children('.capsule-trailer__item').first();
+                            if (first.length) Lampa.Controller.collectionFocus(first, scroll.render(), true);
+                        }
+                    }
+                    catch (e) {}
+                }
             }
             else {
                 status.text(failures.length ? 'Источники сейчас недоступны' : 'Трейлеры не найдены');
