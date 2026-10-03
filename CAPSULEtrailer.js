@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.19.0';
+    var VERSION = '3.20.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v19';
+    var CACHE_KEY = 'capsule_trailer_cache_v20';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -830,6 +830,17 @@
         };
     }
 
+    function browserCanNativeHls() {
+        if (!isBrowserHttpTransport()) return false;
+        try {
+            var probe = document.createElement('video');
+            return !!(probe && probe.canPlayType && probe.canPlayType('application/vnd.apple.mpegurl'));
+        }
+        catch (e) {
+            return false;
+        }
+    }
+
     function directMediaUrl(url) {
         return /^https?:\/\//i.test(String(url || '')) && /\.(?:m3u8|mpd|mp4|m4v)(?:[?#]|$)/i.test(String(url || ''));
     }
@@ -1035,24 +1046,19 @@
         var active = true;
         var cancelCurrent = null;
 
-        cancelCurrent = postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, function (error, data) {
-            if (!active) return;
-            if (!error && data) {
-                done(null, data);
-                return;
-            }
-
-            if (!isBrowserHttpTransport()) {
-                done(error || new Error('ok-metadata'));
-                return;
-            }
-
+        if (isBrowserHttpTransport()) {
             var getUrl = metadataUrl + (metadataUrl.indexOf('?') >= 0 ? '&' : '?') + body;
             cancelCurrent = nativeRequest(getUrl, RESOLVE_TIMEOUT, function (getError, getData) {
                 if (!active) return;
                 done(getError, getData);
             });
-        });
+        }
+        else {
+            cancelCurrent = postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, function (error, data) {
+                if (!active) return;
+                done(error, data);
+            });
+        }
 
         return function () {
             active = false;
@@ -1102,7 +1108,8 @@
                 var selectedType = 'direct';
                 var hls = metadata.hlsManifestUrl || metadata.ondemandHls || '';
 
-                if ((!selected || !selected.url) && hls && /^https?:\/\//i.test(hls)) {
+                if ((!selected || !selected.url) && hls && /^https?:\/\//i.test(hls) &&
+                    (!isBrowserHttpTransport() || browserCanNativeHls())) {
                     selected = { url: hls, height: 0 };
                     selectedType = 'hls';
                 }
@@ -1488,14 +1495,16 @@
         var selected = pickPreferredStream(groups.direct);
 
         if (selected) type = 'direct';
-        else {
+        else if (!isBrowserHttpTransport() || browserCanNativeHls()) {
             selected = pickPreferredStream(groups.hls);
             if (selected) type = 'hls';
-            else {
+            else if (!isBrowserHttpTransport()) {
                 selected = pickPreferredStream(groups.dash);
                 if (selected) type = 'dash';
             }
         }
+
+        log('dzen streams', 'direct=' + groups.direct.length, 'hls=' + groups.hls.length, 'dash=' + groups.dash.length, 'selected=' + type);
 
         if (!selected || !selected.url) {
             done(new Error('dzen-stream'));
@@ -1887,8 +1896,12 @@
             return function () {};
         }
 
-        var url = 'https://vk.com/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
-            '&id=' + encodeURIComponent(parts[2]) + '&autoplay=0';
+        var url = String(item.vkEmbed || '');
+        if (/^\/\//.test(url)) url = 'https:' + url;
+        if (!/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(url)) {
+            url = 'https://vkvideo.ru/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
+                '&id=' + encodeURIComponent(parts[2]) + '&hd=2';
+        }
 
         return textRequest(url, 6500, function (error, text) {
             if (error || !text) return done(error || new Error('vk-public-page'));
@@ -1934,14 +1947,16 @@
         var type = '';
         var selected = pickPreferredStream(groups.direct);
         if (selected) type = 'direct';
-        else {
+        else if (!isBrowserHttpTransport() || browserCanNativeHls()) {
             selected = pickPreferredStream(groups.hls);
             if (selected) type = 'hls';
-            else {
+            else if (!isBrowserHttpTransport()) {
                 selected = pickPreferredStream(groups.dash);
                 if (selected) type = 'dash';
             }
         }
+
+        log('vk streams', 'direct=' + groups.direct.length, 'hls=' + groups.hls.length, 'dash=' + groups.dash.length, 'selected=' + type);
 
         if (!selected || !selected.url) {
             done(new Error('vk-stream'));
@@ -2094,313 +2109,7 @@
         try { Lampa.Controller.toggle('content'); } catch (e3) {}
     }
 
-    function normalizeEmbedUrl(value) {
-        value = decodeHtmlEntities(String(value || ''))
-            .replace(/\\u002f/gi, '/')
-            .replace(/\\\//g, '/')
-            .replace(/\\u0026/gi, '&');
-        if (/^\/\//.test(value)) value = 'https:' + value;
-        return value;
-    }
-
-    function vkEmbedFromText(text, item) {
-        text = normalizeEmbedUrl(text);
-        var re = /https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php\?[^"'<>\\\s]+/ig;
-        var matches = text.match(re) || [];
-        if (!matches.length) return '';
-
-        var id = item && item.vkId ? String(item.vkId) : '';
-        var parts = id.match(/^(-?\d+)_(\d+)$/);
-
-        if (parts) {
-            for (var i = 0; i < matches.length; i++) {
-                var candidate = matches[i];
-                if (candidate.indexOf('oid=' + parts[1]) >= 0 && candidate.indexOf('id=' + parts[2]) >= 0) {
-                    return candidate.replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
-                }
-            }
-        }
-
-        return matches[0].replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
-    }
-
-    function dzenEmbedFromText(text, item) {
-        text = normalizeEmbedUrl(text);
-        var re = /https?:\/\/dzen\.ru\/embed\/[0-9a-z_-]+(?:\?[^"'<>\\\s]*)?/ig;
-        var matches = text.match(re) || [];
-        if (!matches.length) return '';
-
-        var id = item && item.dzenId ? String(item.dzenId) : '';
-        if (id) {
-            for (var i = 0; i < matches.length; i++) {
-                var at = text.indexOf(matches[i]);
-                if (at >= 0) {
-                    var around = text.slice(Math.max(0, at - 5000), Math.min(text.length, at + 5000));
-                    if (around.indexOf(id) >= 0) return matches[i];
-                }
-            }
-        }
-
-        return matches[0];
-    }
-
-    function browserCanEmbedProvider(provider) {
-        return !!(isBrowserHttpTransport() && provider &&
-            (provider.id === 'ok' || provider.id === 'vk' || provider.id === 'dzen'));
-    }
-
-    function resolveBrowserEmbed(provider, item, context, done) {
-        if (!browserCanEmbedProvider(provider) || !item) {
-            done(new Error('browser-embed-provider'));
-            return function () {};
-        }
-
-        var immediate = browserEmbedUrl(provider, item);
-        if (immediate) {
-            done(null, immediate);
-            return function () {};
-        }
-
-        var cancelled = false;
-        var cancelCurrent = null;
-
-        function finish(error, url) {
-            if (cancelled) return;
-            done(error, url);
-        }
-
-        if (provider.id === 'vk') {
-            var page = item.url || ('https://vkvideo.ru/video' + String(item.vkId || ''));
-            cancelCurrent = textRequest(page, 6500, function (error, text) {
-                if (cancelled) return;
-                var embed = !error && text ? vkEmbedFromText(text, item) : '';
-
-                if (!embed && item.vkId) {
-                    var parts = String(item.vkId).match(/^(-?\d+)_(\d+)$/);
-                    if (parts) {
-                        embed = 'https://vkvideo.ru/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
-                            '&id=' + encodeURIComponent(parts[2]) + '&hd=2';
-                    }
-                }
-
-                if (!embed) return finish(error || new Error('vk-embed'));
-                finish(null, embed);
-            });
-
-            return function () {
-                cancelled = true;
-                if (cancelCurrent) cancelCurrent();
-            };
-        }
-
-        if (provider.id === 'dzen') {
-            var watch = item.url || ('https://dzen.ru/video/watch/' + String(item.dzenId || ''));
-            cancelCurrent = textRequest(watch, 6500, function (error, text) {
-                if (cancelled) return;
-                var embed = !error && text ? dzenEmbedFromText(text, item) : '';
-
-                if (embed) {
-                    finish(null, embed);
-                    return;
-                }
-
-                var query = [item.title || '', item.dzenId || '', 'Дзен'].join(' ').replace(/\s+/g, ' ');
-                var yandex = 'https://yandex.ru/video/search?text=' + encodeURIComponent(query);
-                cancelCurrent = textRequest(yandex, 6500, function (searchError, searchText) {
-                    if (cancelled) return;
-                    var yandexEmbed = !searchError && searchText ? dzenEmbedFromText(searchText, item) : '';
-                    if (!yandexEmbed) return finish(searchError || error || new Error('dzen-embed'));
-                    finish(null, yandexEmbed);
-                });
-            });
-
-            return function () {
-                cancelled = true;
-                if (cancelCurrent) cancelCurrent();
-            };
-        }
-
-        finish(new Error('browser-embed-missing'));
-        return function () {};
-    }
-
-    function capsuleEmbedMediaUrl(url) {
-        url = String(url || '');
-        if (!url) return '';
-        return url.replace(/#.*$/, '') + '#capsule-embed';
-    }
-
-    function createCapsuleEmbedTube(callVideo) {
-        var object = $('<div class="player-video__capsule-embed"></div>');
-        var video = object[0];
-        var frame = null;
-        var streamUrl = '';
-        var paused = false;
-        var volume = 1;
-        var muted = false;
-        var destroyed = false;
-
-        function emit(name) {
-            if (destroyed) return;
-            try {
-                var event = document.createEvent('Event');
-                event.initEvent(name, false, false);
-                video.dispatchEvent(event);
-            }
-            catch (e) {}
-        }
-
-        function cleanSource(url) {
-            return String(url || '').replace(/#capsule-embed.*$/i, '');
-        }
-
-        function define(name, getter, setter) {
-            try {
-                Object.defineProperty(video, name, {
-                    configurable: true,
-                    get: getter,
-                    set: setter || function () {}
-                });
-            }
-            catch (e) {}
-        }
-
-        define('src', function () { return streamUrl; }, function (url) {
-            streamUrl = cleanSource(url);
-        });
-        define('currentTime', function () { return 0; }, function () {});
-        define('duration', function () { return 0; });
-        define('paused', function () { return paused; });
-        define('audioTracks', function () { return []; });
-        define('textTracks', function () { return []; });
-        define('videoWidth', function () { return 1280; });
-        define('videoHeight', function () { return 720; });
-        define('buffered', function () {
-            return { length: 0, start: function () { return 0; }, end: function () { return 0; } };
-        });
-        define('volume', function () { return volume; }, function (value) {
-            volume = Math.max(0, Math.min(1, parseFloat(value) || 0));
-        });
-        define('muted', function () { return muted; }, function (value) {
-            muted = !!value;
-        });
-
-        video.canPlayType = function () { return true; };
-        video.size = function () {};
-        video.speed = function () {};
-        video.resize = function () {};
-
-        video.load = function () {
-            if (!streamUrl || frame || destroyed) return;
-
-            frame = document.createElement('iframe');
-            frame.className = 'player-video__capsule-embed-frame';
-            frame.src = streamUrl;
-            frame.setAttribute('frameborder', '0');
-            frame.setAttribute('allowfullscreen', 'true');
-            frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture; screen-wake-lock');
-            frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
-
-            frame.onload = function () {
-                if (destroyed) return;
-                paused = false;
-                emit('canplay');
-                emit('loadeddata');
-                emit('playing');
-            };
-
-            frame.onerror = function () {
-                if (destroyed) return;
-                try { video.error = { code: 4, message: 'CAPSULE EMBED LOAD' }; } catch (e) {}
-                emit('error');
-            };
-
-            object.empty().append(frame);
-        };
-
-        video.play = function () {
-            paused = false;
-            emit('playing');
-            try { return Promise.resolve(); } catch (e) {}
-        };
-
-        video.pause = function () {
-            paused = false;
-            try { return Promise.resolve(); } catch (e) {}
-        };
-
-        video.destroy = function () {
-            destroyed = true;
-            if (frame) {
-                try { frame.src = 'about:blank'; } catch (e) {}
-                try { frame.remove(); } catch (e2) {}
-            }
-            frame = null;
-            object.remove();
-        };
-
-        callVideo(video);
-        return object;
-    }
-
-    function browserEmbedUrl(provider, item) {
-        if (!browserCanEmbedProvider(provider) || !item) return '';
-
-        if (provider.id === 'ok' && item.okId) {
-            return 'https://ok.ru/videoembed/' + encodeURIComponent(item.okId) + '?autoplay=1';
-        }
-
-        if (provider.id === 'vk' && item.vkEmbed) {
-            var player = normalizeEmbedUrl(item.vkEmbed);
-            if (/https?:\/\/(?:vkvideo\.ru|vk\.com)\/video_ext\.php/i.test(player)) {
-                player = player.replace(/^https?:\/\/vk\.com/i, 'https://vkvideo.ru');
-                if (player.indexOf('autoplay=') < 0) player += (player.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1';
-                return player;
-            }
-        }
-
-        if (provider.id === 'dzen' && item.dzenEmbed && /^https?:\/\/dzen\.ru\/embed\//i.test(item.dzenEmbed)) {
-            return item.dzenEmbed + (item.dzenEmbed.indexOf('autoplay=') >= 0 ? '' :
-                (item.dzenEmbed.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1');
-        }
-
-        return '';
-    }
-
-    function browserPlay(provider, item, context, done) {
-        if (!browserCanEmbedProvider(provider)) {
-            if (done) done(false);
-            return false;
-        }
-
-        resolveBrowserEmbed(provider, item, context, function (error, url) {
-            if (error || !url) {
-                log('browser embed resolve error', provider.id, error);
-                if (done) done(false);
-                return;
-            }
-
-            try {
-                closeSourceSelectionState();
-                Lampa.Player.play({
-                    url: capsuleEmbedMediaUrl(url),
-                    title: item.title,
-                    card: context.movie,
-                    capsule_trailer: true,
-                    capsule_source: provider.id + '-embed',
-                    capsule_embed: true
-                });
-                log('browser player embed', provider.id, url);
-                if (done) done(true);
-            }
-            catch (e) {
-                log('browser Player.play embed error', provider.id, e);
-                if (done) done(false);
-            }
-        });
-
-        return true;
-    }
+    
 
     function collectAutoplayCandidates(context, done) {
         var active = true;
@@ -2533,13 +2242,6 @@
                     return;
                 }
 
-                if (browserCanEmbedProvider(selected.provider)) {
-                    if (browserPlay(selected.provider, selected.item, context, function (opened) {
-                        if (opened) done(true);
-                        else next();
-                    })) return;
-                }
-
                 if (typeof selected.provider.resolve !== 'function') {
                     next();
                     return;
@@ -2585,18 +2287,9 @@
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
 
-        if (!window.capsule_trailer_embed_tube) {
-            var embedRegistration = {
-                name: 'CAPSULE EMBED',
-                verify: function (src) {
-                    return isBrowserHttpTransport() && String(src || '').indexOf('#capsule-embed') >= 0;
-                },
-                create: createCapsuleEmbedTube
-            };
-
-            if (Lampa.PlayerVideo.registerTube(embedRegistration)) {
-                window.capsule_trailer_embed_tube = embedRegistration;
-            }
+        if (window.capsule_trailer_embed_tube && typeof Lampa.PlayerVideo.removeTube === 'function') {
+            try { Lampa.PlayerVideo.removeTube(window.capsule_trailer_embed_tube); } catch (e) {}
+            window.capsule_trailer_embed_tube = null;
         }
 
         if (window.capsule_trailer_media_tube) return;
@@ -2639,7 +2332,6 @@
 
         Lampa.Player.listener.follow('start', function (data) {
             if (!data || !data.capsule_trailer) return;
-            if (data.capsule_embed) return;
 
             var active = true;
             var used = false;
@@ -2749,8 +2441,6 @@
         var style = document.createElement('style');
         style.id = 'capsule-trailer-style';
         style.textContent = '' +
-            '.player-video__capsule-embed{position:absolute;inset:0;width:100%;height:100%;background:#000;overflow:hidden}' +
-            '.player-video__capsule-embed-frame{display:block;width:100%;height:100%;border:0;background:#000}' +
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box;background:#17181a}' +
             '.capsule-trailer{width:100%;min-height:100%;box-sizing:border-box;color:inherit;background:#17181a;padding-bottom:3em}' +
 
@@ -3322,16 +3012,6 @@
 
         function play(item, provider) {
             if (!alive || !provider) return;
-
-            if (browserCanEmbedProvider(provider)) {
-                self.activity.loader(true);
-                browserPlay(provider, item, context, function (opened) {
-                    if (!alive) return;
-                    self.activity.loader(false);
-                    if (!opened) Lampa.Noty.show('Видео недоступно в браузере');
-                });
-                return;
-            }
 
             if (typeof provider.resolve !== 'function') return;
             if (resolvingCancel) {
