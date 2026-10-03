@@ -1187,6 +1187,7 @@
 
         function push(url, height) {
             url = String(url || '');
+            if (/^\/\//.test(url)) url = 'https:' + url;
             if (!/^https?:\/\//i.test(url)) return;
             var entry = { url: url, height: parseInt(height, 10) || yandexTypeHeight(url) || 0 };
             if (/\.m3u8(?:[?#]|$)|[?&]ct=8(?:&|$)/i.test(url)) hls.push(entry);
@@ -1368,6 +1369,7 @@
         for (var i = 0; i < images.length; i++) {
             var row = images[i] || {};
             var url = String(row.url || '');
+            if (/^\/\//.test(url)) url = 'https:' + url;
             var width = parseInt(row.width, 10) || 0;
             if (url && width >= bestWidth) {
                 best = url;
@@ -1449,6 +1451,7 @@
         for (var key in files) {
             if (!Object.prototype.hasOwnProperty.call(files, key)) continue;
             var url = String(files[key] || '');
+            if (/^\/\//.test(url)) url = 'https:' + url;
             if (!/^https?:\/\//i.test(url)) continue;
 
             var directMatch = String(key).match(/^mp4_(\d+)$/);
@@ -1955,7 +1958,7 @@
             '.capsule-trailer__item--best .capsule-trailer__source{opacity:.68;border-color:rgba(255,255,255,.22)}' +
             '.capsule-trailer__line{font-size:.81em;opacity:.48;margin-top:.38em;line-height:1.35}' +
             '.capsule-trailer__empty{padding:2.8em 1em 1.8em;text-align:center;opacity:.52;font-size:.95em}' +
-            '.capsule-trailer__retry{display:flex;width:max-content;margin:1em auto 0;padding:.68em 1em;border-radius:.7em;background:rgba(255,255,255,.085)}' +
+            '.capsule-trailer__retry{display:table;margin:1em auto 0;padding:.68em 1em;border-radius:.7em;background:rgba(255,255,255,.085)}' +
             '.capsule-trailer__loading{padding:.15em .72em 1.2em}' +
             '.capsule-trailer__loading.hide{display:none}' +
             '.capsule-trailer__skeleton{display:flex;align-items:center;min-height:6.8em;padding:.7em .72em;box-sizing:border-box}' +
