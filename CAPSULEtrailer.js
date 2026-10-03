@@ -1,6 +1,6 @@
 /*
  * CAPSULE Trailer for Lampa
- * Minimal trailer provider focused on sources that can be used without a browser hand-off.
+ * Multi-provider trailer aggregator with isolated discovery and playback adapters.
  *
  * Integration points verified against current Lampa source:
  * - Lampa.Listener 'full' / type 'complite'
@@ -10,9 +10,11 @@
  * - Lampa.Reguest
  * - Lampa.Player / Lampa.PlayerVideo.registerTube
  *
- * Providers:
- * 1. Native direct trailers already present in the Lampa full-card payload (YouTube excluded).
- * 2. RUTUBE public search + official embed player API; Android additionally attempts direct HLS.
+ * Discovery / playback layers:
+ * - Lampa/TMDB video metadata, including YouTube IDs already fetched for the movie card.
+ * - Yandex Video/VH and OK.ru as isolated experimental providers for Russian trailers.
+ * - Optional self-hosted Invidious/Piped transport for YouTube; no public proxy is hardcoded.
+ * - RUTUBE is a low-priority fallback, not the primary source.
  */
 (function () {
     'use strict';
@@ -20,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '1.0.0';
+    var VERSION = '2.0.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v1';
+    var CACHE_KEY = 'capsule_trailer_cache_v2';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -151,56 +153,81 @@
         return found / target.length;
     }
 
-    function scoreRutube(item, movie) {
-        if (!item || !item.id || !item.title) return -9999;
-        if (item.is_hidden || item.is_deleted || item.is_locked || item.is_audio || item.is_paid || item.is_livestream || item.is_adult) return -9999;
+    function qualityNumber(value) {
+        var match = String(value || '').match(/(2160|1440|1080|720|480|360|240|144)/);
+        return match ? parseInt(match[1], 10) : 0;
+    }
 
+    function trailerKind(value) {
+        var text = cleanText(value);
+        if (/(^| )(тизер|teaser)( |$)/.test(text)) return 'teaser';
+        if (/(^| )(трейлер|trailer)( |$)/.test(text)) return 'trailer';
+        return '';
+    }
+
+    function movieKey(movie) {
+        return mediaType(movie) + ':' + (movie && movie.id || cleanText(movie && (movie.title || movie.name) || '')) + ':' + yearOf(movie);
+    }
+
+    function scoreCandidate(item, movie, exactMovieMatch) {
+        if (!item || !item.title) return -9999;
         var duration = parseInt(item.duration, 10) || 0;
-        if (duration && (duration < 15 || duration > 600)) return -9999;
-        if (!isTrailerTitle(item.title)) return -9999;
+        var kind = item.kind || trailerKind(item.title);
+        if (!kind && !exactMovieMatch) return -9999;
+        if (duration && (duration < 12 || duration > 900)) return -9999;
 
+        var score = exactMovieMatch ? 260 : 0;
         var variants = titleVariants(movie);
-        var normalizedTitle = cleanText(item.title);
-        var best = 0;
+        var resultTitle = cleanText(item.title);
+        var best = exactMovieMatch ? 100 : 0;
 
         for (var i = 0; i < variants.length; i++) {
-            var variant = variants[i];
-            var c = coverage(normalizedTitle, variant);
+            var c = coverage(resultTitle, variants[i]);
             var value = Math.round(c * 100);
-            if (normalizedTitle.indexOf(variant) >= 0) value += 95;
+            if (resultTitle.indexOf(variants[i]) >= 0) value += 95;
             if (c === 1) value += 35;
             if (value > best) best = value;
         }
 
-        if (best < 70) return -9999;
+        if (!exactMovieMatch && best < 70) return -9999;
+        score += best;
 
-        var score = best + 35;
         var year = yearOf(movie);
         var years = explicitYears(item.title + ' ' + (item.description || ''));
         if (year) {
-            if (years.indexOf(year) >= 0) score += 40;
+            if (String(item.year || '') === year || years.indexOf(year) >= 0) score += 45;
             else if (years.length) {
                 var near = false;
                 for (var y = 0; y < years.length; y++) {
                     if (Math.abs(parseInt(years[y], 10) - parseInt(year, 10)) <= 1) near = true;
                 }
-                if (!near) return -9999;
-                score -= 10;
+                if (!near && !exactMovieMatch) return -9999;
+                if (!near) score -= 60;
             }
         }
 
         var text = cleanText(item.title + ' ' + (item.description || ''));
-        if (/(официальн|official)/.test(text)) score += 20;
-        if (/(русск|дубляж|дублирован)/.test(text)) score += 18;
-        if (duration >= 45 && duration <= 240) score += 12;
+        var lang = inferLanguage(item).toLowerCase();
+        if (item.official || /(^| )(официальн|official)( |$)/.test(text)) score += 42;
+        if (kind === 'trailer') score += 28;
+        if (kind === 'teaser') score += 10;
+        if (lang === 'ru' || lang === 'rus') score += 34;
+        if (duration >= 45 && duration <= 240) score += 16;
+
+        var quality = qualityNumber(item.qualityHint);
+        if (quality >= 2160) score += 28;
+        else if (quality >= 1080) score += 22;
+        else if (quality >= 720) score += 14;
+        else if (quality >= 480) score += 5;
 
         if (mediaType(movie) === 'tv') {
-            if (/(сериал|series|season|сезон)/.test(text)) score += 12;
+            if (/(сериал|series|season|сезон)/.test(text)) score += 10;
         }
-        else if (/(сериал|season|сезон)/.test(text)) {
-            score -= 35;
+        else if (/(сериал|season|сезон)/.test(text) && !exactMovieMatch) {
+            score -= 45;
         }
 
+        score += parseInt(item.transportScore, 10) || 0;
         return score;
     }
 
@@ -216,24 +243,26 @@
         var cache = Lampa.Storage.get(CACHE_KEY, {});
         if (!cache || typeof cache !== 'object') cache = {};
         cache[key] = { time: Date.now(), items: items };
-
         var keys = Object.keys(cache);
         if (keys.length > CACHE_MAX) {
-            keys.sort(function (a, b) {
-                return (cache[a].time || 0) - (cache[b].time || 0);
-            });
+            keys.sort(function (a, b) { return (cache[a].time || 0) - (cache[b].time || 0); });
             while (keys.length > CACHE_MAX) delete cache[keys.shift()];
         }
-
         Lampa.Storage.set(CACHE_KEY, cache, true);
     }
 
-    function cacheDrop(key) {
+    function cacheDropMovie(movie) {
         var cache = Lampa.Storage.get(CACHE_KEY, {});
-        if (cache && typeof cache === 'object' && cache[key]) {
-            delete cache[key];
-            Lampa.Storage.set(CACHE_KEY, cache, true);
-        }
+        if (!cache || typeof cache !== 'object') return;
+        var suffix = ':' + movieKey(movie);
+        var changed = false;
+        Object.keys(cache).forEach(function (key) {
+            if (key.slice(-suffix.length) === suffix) {
+                delete cache[key];
+                changed = true;
+            }
+        });
+        if (changed) Lampa.Storage.set(CACHE_KEY, cache, true);
     }
 
     function jsonp(url, timeout, done) {
@@ -251,27 +280,17 @@
             done(error, data);
         }
 
-        window[callbackName] = function (data) {
-            finish(null, data);
-        };
-
+        window[callbackName] = function (data) { finish(null, data); };
         script.async = true;
-        script.onerror = function () {
-            finish(new Error('jsonp-network'));
-        };
+        script.onerror = function () { finish(new Error('jsonp-network')); };
         script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'format=jsonp&callback=' + encodeURIComponent(callbackName);
         document.head.appendChild(script);
+        timer = setTimeout(function () { finish(new Error('jsonp-timeout')); }, timeout || SEARCH_TIMEOUT);
 
-        timer = setTimeout(function () {
-            finish(new Error('jsonp-timeout'));
-        }, timeout || SEARCH_TIMEOUT);
-
-        return function () {
-            finish(new Error('cancelled'));
-        };
+        return function () { finish(new Error('cancelled')); };
     }
 
-    function nativeRequest(url, timeout, done) {
+    function requestData(url, dataType, timeout, done) {
         var network = new Lampa.Reguest();
         var finished = false;
         network.timeout(timeout || SEARCH_TIMEOUT);
@@ -280,7 +299,8 @@
             if (finished) return;
             finished = true;
             try { network.clear(); } catch (e) {}
-            done(error, parseMaybeJson(data));
+            if (!error && dataType === 'json') data = parseMaybeJson(data);
+            done(error, data);
         }
 
         try {
@@ -290,8 +310,52 @@
                 finish(new Error('network'));
             }, false, {
                 timeout: timeout || SEARCH_TIMEOUT,
+                dataType: dataType,
+                headers: { 'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json' }
+            });
+        }
+        catch (e) {
+            finish(e);
+        }
+
+        return function () {
+            finished = true;
+            try { network.clear(); } catch (e) {}
+        };
+    }
+
+    function nativeRequest(url, timeout, done) {
+        return requestData(url, 'json', timeout, done);
+    }
+
+    function textRequest(url, timeout, done) {
+        return requestData(url, 'text', timeout, done);
+    }
+
+    function postRequest(url, dataType, timeout, postData, done) {
+        var network = new Lampa.Reguest();
+        var finished = false;
+        network.timeout(timeout || SEARCH_TIMEOUT);
+
+        function finish(error, data) {
+            if (finished) return;
+            finished = true;
+            try { network.clear(); } catch (e) {}
+            if (!error && dataType === 'json') data = parseMaybeJson(data);
+            done(error, data);
+        }
+
+        try {
+            network.native(url, function (data) {
+                finish(null, data);
+            }, function () {
+                finish(new Error('network'));
+            }, postData || '', {
+                timeout: timeout || SEARCH_TIMEOUT,
+                dataType: dataType,
                 headers: {
-                    'Accept': 'application/json'
+                    'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
                 }
             });
         }
@@ -305,16 +369,743 @@
         };
     }
 
+    function backendBase() {
+        var value = Lampa.Storage.field('capsule_trailer_youtube_backend') || '';
+        value = String(value).replace(/^\s+|\s+$/g, '').replace(/\/+$/, '');
+        return /^https?:\/\//i.test(value) ? value : '';
+    }
+
+    var backendDetected = '';
+
+    function youtubeId(value) {
+        var text = String(value || '');
+        var match = text.match(/(?:v=|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})/);
+        if (!match && /^[A-Za-z0-9_-]{11}$/.test(text)) return text;
+        return match ? match[1] : '';
+    }
+
+    function directMediaUrl(url) {
+        return /^https?:\/\//i.test(String(url || '')) && /\.(?:m3u8|mpd|mp4|m4v)(?:[?#]|$)/i.test(String(url || ''));
+    }
+
+    function qualityMapFromStreams(streams, urlField, heightField, usable) {
+        var quality = {};
+        var bestUrl = '';
+        var bestHeight = 0;
+        for (var i = 0; i < (streams || []).length; i++) {
+            var stream = streams[i] || {};
+            if (usable && !usable(stream)) continue;
+            var url = stream[urlField || 'url'];
+            if (!/^https?:\/\//i.test(String(url || ''))) continue;
+            var height = parseInt(stream[heightField || 'height'], 10) || qualityNumber(stream.quality || stream.qualityLabel || stream.resolution);
+            var label = height ? height + 'p' : (stream.qualityLabel || stream.quality || 'Auto');
+            quality[label] = url;
+            if (!bestUrl || height > bestHeight) {
+                bestUrl = url;
+                bestHeight = height;
+            }
+        }
+        return { quality: quality, url: bestUrl, height: bestHeight };
+    }
+
+    function resolveYoutubeViaInvidious(base, id, done) {
+        return nativeRequest(base + '/api/v1/videos/' + encodeURIComponent(id) + '?local=true&region=RU', RESOLVE_TIMEOUT, function (error, data) {
+            if (error || !data || !data.videoId) return done(error || new Error('invidious-invalid'));
+            backendDetected = 'invidious';
+            var mapped = qualityMapFromStreams(data.formatStreams || [], 'url', 'height', function (stream) {
+                return String(stream.container || '').toLowerCase() === 'mp4' || /video\/mp4/i.test(String(stream.type || ''));
+            });
+            if (!mapped.url && data.hlsUrl) mapped.url = data.hlsUrl;
+            if (!mapped.url && data.dashUrl) mapped.url = data.dashUrl;
+            if (!mapped.url) return done(new Error('invidious-no-playable'));
+            done(null, mapped);
+        });
+    }
+
+    function resolveYoutubeViaPiped(base, id, done) {
+        return nativeRequest(base + '/streams/' + encodeURIComponent(id), RESOLVE_TIMEOUT, function (error, data) {
+            if (error || !data || !data.videoStreams) return done(error || new Error('piped-invalid'));
+            backendDetected = 'piped';
+            var mapped = qualityMapFromStreams(data.videoStreams || [], 'url', 'height', function (stream) {
+                return stream.videoOnly === false && /video\/mp4/i.test(String(stream.mimeType || ''));
+            });
+            if (!mapped.url && data.hls) mapped.url = data.hls;
+            if (!mapped.url && data.dash) mapped.url = data.dash;
+            if (!mapped.url) return done(new Error('piped-no-playable'));
+            done(null, mapped);
+        });
+    }
+
+    function resolveYoutube(item, context, done) {
+        var id = item.videoId || youtubeId(item.url);
+        if (!id) {
+            done(new Error('youtube-id'));
+            return function () {};
+        }
+
+        var official = {
+            url: 'https://www.youtube.com/watch?v=' + id,
+            title: item.title,
+            card: context.movie,
+            capsule_trailer: true,
+            capsule_source: 'youtube-official'
+        };
+        var base = backendBase();
+        if (!base) {
+            done(null, official);
+            return function () {};
+        }
+
+        var cancelled = false;
+        var cancelCurrent = null;
+        function complete(error, mapped) {
+            if (cancelled) return;
+            if (error || !mapped || !mapped.url) return done(null, official);
+            done(null, {
+                url: mapped.url,
+                quality: mapped.quality && Object.keys(mapped.quality).length > 1 ? mapped.quality : undefined,
+                title: item.title,
+                card: context.movie,
+                capsule_trailer: true,
+                capsule_source: 'youtube-selfhosted',
+                capsule_fallback: official.url,
+                capsule_fallback_source: 'youtube-official'
+            });
+        }
+
+        function tryInvidious() {
+            cancelCurrent = resolveYoutubeViaInvidious(base, id, complete);
+        }
+        function tryPiped() {
+            cancelCurrent = resolveYoutubeViaPiped(base, id, function (error, mapped) {
+                if (!error && mapped) return complete(null, mapped);
+                if (backendDetected === 'piped') return complete(error);
+                tryInvidious();
+            });
+        }
+
+        if (backendDetected === 'invidious') tryInvidious();
+        else if (backendDetected === 'piped') tryPiped();
+        else tryPiped();
+
+        return function () {
+            cancelled = true;
+            if (cancelCurrent) cancelCurrent();
+        };
+    }
+
+    function normalizeTmdb(videos, movie) {
+        var out = [];
+        var list = videos && videos.results ? videos.results : [];
+        var backend = backendBase();
+        for (var i = 0; i < list.length; i++) {
+            var raw = list[i] || {};
+            var site = String(raw.site || '').toLowerCase();
+            if (site === 'youtube' && raw.key) {
+                var item = {
+                    id: 'youtube:' + raw.key,
+                    canonical: 'youtube:' + raw.key,
+                    provider: 'tmdb',
+                    providerName: 'TMDB / YouTube',
+                    title: raw.name || (raw.type === 'Teaser' ? 'Teaser' : 'Official Trailer'),
+                    description: '',
+                    duration: 0,
+                    thumbnail: 'https://i.ytimg.com/vi/' + encodeURIComponent(raw.key) + '/hqdefault.jpg',
+                    author: '',
+                    language: raw.iso_639_1 || '',
+                    qualityHint: raw.size ? String(raw.size) + 'p' : '',
+                    year: yearOf(movie),
+                    kind: String(raw.type || '').toLowerCase() === 'teaser' ? 'teaser' : 'trailer',
+                    official: raw.official === true,
+                    videoId: raw.key,
+                    url: 'https://www.youtube.com/watch?v=' + raw.key,
+                    transportScore: backend ? 110 : 20,
+                    exactMovieMatch: true
+                };
+                item.score = scoreCandidate(item, movie, true);
+                out.push(item);
+            }
+            else if (directMediaUrl(raw.url)) {
+                var direct = {
+                    id: 'direct:' + raw.url,
+                    canonical: 'direct:' + raw.url,
+                    provider: 'tmdb',
+                    providerName: 'Lampa',
+                    title: raw.name || 'Трейлер',
+                    description: '',
+                    duration: 0,
+                    thumbnail: raw.icon || '',
+                    author: '',
+                    language: raw.iso_639_1 || '',
+                    qualityHint: raw.size ? String(raw.size) + 'p' : '',
+                    year: yearOf(movie),
+                    kind: String(raw.type || '').toLowerCase() === 'teaser' ? 'teaser' : 'trailer',
+                    official: raw.official === true,
+                    url: raw.url,
+                    transportScore: 140,
+                    exactMovieMatch: true
+                };
+                direct.score = scoreCandidate(direct, movie, true);
+                out.push(direct);
+            }
+        }
+        out.sort(function (a, b) { return b.score - a.score; });
+        return out;
+    }
+
+    var TmdbProvider = {
+        id: 'tmdb',
+        name: 'TMDB',
+        tier: 'stable',
+        search: function (context, done) {
+            done(null, normalizeTmdb(context.videos, context.movie));
+            return function () {};
+        },
+        resolve: function (item, context, done) {
+            if (item.videoId) return resolveYoutube(item, context, done);
+            done(null, { url: item.url, title: item.title, card: context.movie, capsule_trailer: true, capsule_source: 'direct' });
+            return function () {};
+        }
+    };
+
+    function searchYoutubeBackend(context, done) {
+        var base = backendBase();
+        if (!base) {
+            done(null, []);
+            return function () {};
+        }
+        var movie = context.movie || {};
+        var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+        var original = movie.original_title || movie.original_name || '';
+        var year = yearOf(movie);
+        var queries = [];
+        var seen = {};
+        var results = [];
+        var cancelled = false;
+        var cancelCurrent = null;
+        var index = 0;
+        var cacheKey = 'youtube-backend:' + movieKey(movie);
+        var cached = cacheGet(cacheKey);
+        if (cached) {
+            done(null, cached);
+            return function () {};
+        }
+
+        function addQuery(q) {
+            q = String(q || '').replace(/^\s+|\s+$/g, '');
+            if (q && queries.indexOf(q) < 0) queries.push(q);
+        }
+        addQuery([title, year, 'официальный трейлер'].join(' '));
+        if (original && cleanText(original) !== cleanText(title)) addQuery([original, year, 'official trailer'].join(' '));
+
+        function normalize(raw, type) {
+            var id = '';
+            if (type === 'invidious') id = raw.videoId || '';
+            else id = youtubeId(raw.url || raw.videoId || '');
+            if (!id || seen[id]) return;
+            var thumbnails = raw.videoThumbnails || [];
+            var thumb = raw.thumbnail || (thumbnails.length ? thumbnails[thumbnails.length - 1].url : '');
+            var item = {
+                id: 'youtube:' + id,
+                canonical: 'youtube:' + id,
+                provider: 'youtube-backend',
+                providerName: 'YouTube',
+                title: raw.title || 'Trailer',
+                description: raw.description || '',
+                duration: parseInt(raw.lengthSeconds || raw.duration, 10) || 0,
+                thumbnail: thumb || ('https://i.ytimg.com/vi/' + id + '/hqdefault.jpg'),
+                author: raw.author || raw.uploaderName || raw.uploader || '',
+                language: '',
+                qualityHint: '',
+                year: year,
+                kind: trailerKind(raw.title),
+                official: /official/i.test(String(raw.title || '')) || raw.uploaderVerified === true,
+                videoId: id,
+                url: 'https://www.youtube.com/watch?v=' + id,
+                transportScore: 105,
+                exactMovieMatch: false
+            };
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) {
+                seen[id] = true;
+                results.push(item);
+            }
+        }
+
+        function finish() {
+            if (cancelled) return;
+            results.sort(function (a, b) { return b.score - a.score; });
+            results = results.slice(0, 8);
+            cachePut(cacheKey, results);
+            done(null, results);
+        }
+
+        function queryInvidious(q, callback) {
+            return nativeRequest(base + '/api/v1/search?q=' + encodeURIComponent(q) + '&type=video&sort=relevance&region=RU', SEARCH_TIMEOUT, function (error, data) {
+                if (!error && Object.prototype.toString.call(data) === '[object Array]') backendDetected = 'invidious';
+                callback(error, data);
+            });
+        }
+
+        function queryPiped(q, callback) {
+            return nativeRequest(base + '/search?q=' + encodeURIComponent(q) + '&filter=videos', SEARCH_TIMEOUT, function (error, data) {
+                if (!error && data && data.items) backendDetected = 'piped';
+                callback(error, data);
+            });
+        }
+
+        function next() {
+            if (cancelled) return;
+            if (index >= queries.length) return finish();
+            var q = queries[index++];
+
+            function consume(type, data) {
+                var list = type === 'piped' ? (data && data.items || []) : (data || []);
+                for (var i = 0; i < list.length; i++) normalize(list[i], type);
+                next();
+            }
+
+            if (backendDetected === 'invidious') {
+                cancelCurrent = queryInvidious(q, function (error, data) {
+                    if (error) return next();
+                    consume('invidious', data);
+                });
+            }
+            else if (backendDetected === 'piped') {
+                cancelCurrent = queryPiped(q, function (error, data) {
+                    if (error) return next();
+                    consume('piped', data);
+                });
+            }
+            else {
+                cancelCurrent = queryInvidious(q, function (error, data) {
+                    if (!error && Object.prototype.toString.call(data) === '[object Array]') return consume('invidious', data);
+                    cancelCurrent = queryPiped(q, function (error2, data2) {
+                        if (!error2 && data2 && data2.items) return consume('piped', data2);
+                        next();
+                    });
+                });
+            }
+        }
+
+        next();
+        return function () {
+            cancelled = true;
+            if (cancelCurrent) cancelCurrent();
+        };
+    }
+
+    var YoutubeBackendProvider = {
+        id: 'youtube-backend',
+        name: 'YouTube backend',
+        tier: 'stable-optional',
+        search: searchYoutubeBackend,
+        resolve: resolveYoutube
+    };
+
+    function decodeJsonString(raw) {
+        if (typeof raw !== 'string') return '';
+        try { return JSON.parse('"' + raw.replace(/"/g, '\\"') + '"'); } catch (e) {}
+        return raw.replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+    }
+
+    function extractNearby(text, start, end, pattern) {
+        var part = text.slice(Math.max(0, start), Math.min(text.length, end));
+        var match = part.match(pattern);
+        return match ? match[1] : '';
+    }
+
+    function parseYandexCandidates(text, movie) {
+        text = String(text || '');
+        var out = [];
+        var seen = {};
+        var marker = '"trailerIframeUrl":"';
+        var pos = 0;
+        while ((pos = text.indexOf(marker, pos)) >= 0) {
+            var valueStart = pos + marker.length;
+            var valueEnd = text.indexOf('"', valueStart);
+            if (valueEnd < 0) break;
+            var iframe = decodeJsonString(text.slice(valueStart, valueEnd));
+            if (iframe.indexOf('//') === 0) iframe = 'https:' + iframe;
+            var before = text.slice(Math.max(0, pos - 3600), pos);
+            var after = text.slice(valueEnd, Math.min(text.length, valueEnd + 3600));
+            var nearby = before + after;
+            var titleMatches = before.match(/"title":"((?:\\.|[^"\\])*)"/g) || [];
+            var titleRaw = titleMatches.length ? titleMatches[titleMatches.length - 1].replace(/^"title":"|"$/g, '') : '';
+            var title = decodeJsonString(titleRaw);
+            var yearMatch = nearby.match(/"releaseYear":(\d{4})/);
+            var kpMatch = nearby.match(/"kpId":"?(\d+)"?/);
+            var idMatch = iframe.match(/frontend\.vh\.yandex\.ru\/player\/([A-Za-z0-9_-]+)/i);
+            if (idMatch && title && !seen[idMatch[1]]) {
+                var item = {
+                    id: 'yandex:' + idMatch[1],
+                    canonical: 'yandex:' + idMatch[1],
+                    provider: 'yandex',
+                    providerName: 'Yandex Video',
+                    title: title + ' — трейлер',
+                    description: '',
+                    duration: 0,
+                    thumbnail: imageUrl(movie),
+                    author: '',
+                    language: 'ru',
+                    qualityHint: '',
+                    year: yearMatch ? yearMatch[1] : '',
+                    kind: 'trailer',
+                    official: true,
+                    yandexId: idMatch[1],
+                    yandexPlayer: iframe,
+                    kpId: kpMatch ? kpMatch[1] : '',
+                    transportScore: 125,
+                    exactMovieMatch: false
+                };
+                var exact = Boolean(movie.kinopoisk_id && item.kpId && String(movie.kinopoisk_id) === String(item.kpId));
+                item.exactMovieMatch = exact;
+                item.score = scoreCandidate(item, movie, exact);
+                if (item.score >= 0) {
+                    seen[idMatch[1]] = true;
+                    out.push(item);
+                }
+            }
+            pos = valueEnd + 1;
+        }
+        out.sort(function (a, b) { return b.score - a.score; });
+        return out.slice(0, 3);
+    }
+
+    function resolveYandex(item, context, done) {
+        var id = item.yandexId;
+        if (!id) {
+            done(new Error('yandex-id'));
+            return function () {};
+        }
+        var url = 'https://frontend.vh.yandex.ru/v23/player/' + encodeURIComponent(id) + '.json?stream_options=hires&disable_trackings=1';
+        return nativeRequest(url, RESOLVE_TIMEOUT, function (error, data) {
+            if (error || !data || !data.content) return done(error || new Error('yandex-invalid'));
+            var content = data.content;
+            var streams = content.streams || [];
+            var candidates = [];
+            for (var i = 0; i < streams.length; i++) {
+                if (streams[i] && streams[i].url) candidates.push(streams[i].url);
+            }
+            if (content.content_url) candidates.push(content.content_url);
+            var selected = '';
+            for (var p = 0; p < candidates.length; p++) {
+                if (/\.m3u8(?:[?#]|$)/i.test(candidates[p])) { selected = candidates[p]; break; }
+            }
+            if (!selected) {
+                for (var d = 0; d < candidates.length; d++) {
+                    if (/\.mpd(?:[?#]|$)/i.test(candidates[d])) { selected = candidates[d]; break; }
+                }
+            }
+            if (!selected) {
+                for (var f = 0; f < candidates.length; f++) {
+                    if (/^https?:\/\//i.test(candidates[f])) { selected = candidates[f]; break; }
+                }
+            }
+            if (!selected) return done(new Error('yandex-no-stream'));
+            done(null, {
+                url: selected,
+                title: item.title,
+                card: context.movie,
+                capsule_trailer: true,
+                capsule_source: 'yandex-vh'
+            });
+        });
+    }
+
+    var YandexProvider = {
+        id: 'yandex',
+        name: 'Yandex Video',
+        tier: 'experimental',
+        search: function (context, done) {
+            if (Lampa.Storage.field('capsule_trailer_yandex') === false) {
+                done(null, []);
+                return function () {};
+            }
+            var movie = context.movie || {};
+            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+            var original = movie.original_title || movie.original_name || '';
+            var year = yearOf(movie);
+            var queries = [];
+            var all = [];
+            var seen = {};
+            var index = 0;
+            var cancelled = false;
+            var cancelCurrent = null;
+            var key = 'yandex:' + movieKey(movie);
+            var cached = cacheGet(key);
+            if (cached) {
+                done(null, cached);
+                return function () {};
+            }
+            queries.push([title, year, mediaType(movie) === 'tv' ? 'сериал' : 'фильм'].join(' '));
+            if (original && cleanText(original) !== cleanText(title)) queries.push([original, year, mediaType(movie) === 'tv' ? 'series' : 'movie'].join(' '));
+
+            function finish() {
+                if (cancelled) return;
+                all.sort(function (a, b) { return b.score - a.score; });
+                all = all.slice(0, 3);
+                cachePut(key, all);
+                done(null, all);
+            }
+
+            function next() {
+                if (cancelled) return;
+                if (index >= queries.length) return finish();
+                var q = queries[index++];
+                var url = 'https://yandex.ru/video/search?text=' + encodeURIComponent(q);
+                cancelCurrent = textRequest(url, 6500, function (error, body) {
+                    if (!error && body) {
+                        var parsed = parseYandexCandidates(body, movie);
+                        for (var i = 0; i < parsed.length; i++) {
+                            if (!seen[parsed[i].id]) {
+                                seen[parsed[i].id] = true;
+                                all.push(parsed[i]);
+                            }
+                        }
+                    }
+                    next();
+                });
+            }
+
+            next();
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
+        },
+        resolve: resolveYandex
+    };
+
+    function decodeHtmlEntities(value) {
+        value = String(value || '');
+        if (value.indexOf('&') < 0) return value;
+        return value.replace(/&(#x?[0-9a-f]+|quot|amp|apos|#39|lt|gt|nbsp);/gi, function (all, entity) {
+            var name = String(entity || '').toLowerCase();
+            if (name === 'quot') return '"';
+            if (name === 'amp') return '&';
+            if (name === 'apos' || name === '#39') return "'";
+            if (name === 'lt') return '<';
+            if (name === 'gt') return '>';
+            if (name === 'nbsp') return ' ';
+            if (name.charAt(0) === '#') {
+                var hex = name.charAt(1) === 'x';
+                var num = parseInt(name.slice(hex ? 2 : 1), hex ? 16 : 10);
+                if (!isNaN(num)) return String.fromCharCode(num);
+            }
+            return all;
+        });
+    }
+
+    function htmlAttribute(tag, name) {
+        var marker = name + '=';
+        var at = tag.indexOf(marker);
+        if (at < 0) return '';
+        var start = at + marker.length;
+        var quote = tag.charAt(start);
+        if (quote !== '"' && quote !== "'") return '';
+        var end = tag.indexOf(quote, start + 1);
+        return end < 0 ? '' : tag.slice(start + 1, end);
+    }
+
+    function okNativeProvider(value) {
+        value = String(value || '').replace(/_/g, '').toUpperCase();
+        return !value || value === 'UPLOADEDODKL' || value === 'LIVETVAPP';
+    }
+
+    function parseOkSearch(text, movie) {
+        text = String(text || '');
+        var component = text.indexOf('<video-search-result');
+        var tagEnd = component < 0 ? -1 : text.indexOf('>', component);
+        if (component < 0 || tagEnd < 0) return [];
+        var encoded = htmlAttribute(text.slice(component, tagEnd + 1), 'data-props');
+        if (!encoded) return [];
+        var props;
+        try { props = JSON.parse(decodeHtmlEntities(encoded)); } catch (e) { return []; }
+        var list = props && props.videos && props.videos.list;
+        if (!list || Object.prototype.toString.call(list) !== '[object Array]') return [];
+
+        var out = [];
+        var seen = {};
+        for (var i = 0; i < list.length && out.length < 10; i++) {
+            var card = list[i] || {};
+            var raw = card.movie || {};
+            if (raw.blocked || !okNativeProvider(raw.provider)) continue;
+            var id = String(raw.id || '');
+            if (!/^-?\d+$/.test(id) || seen[id]) continue;
+            var title = decodeHtmlEntities(card.name || raw.title || '');
+            if (!title) continue;
+            var durationMs = parseInt(raw.duration, 10) || 0;
+            var width = parseInt(raw.width, 10) || 0;
+            var height = parseInt(raw.height, 10) || 0;
+            var thumbnail = decodeHtmlEntities(card.imageUrl || (raw.thumbnail && (raw.thumbnail.big || raw.thumbnail.small)) || '');
+            var item = {
+                id: 'ok:' + id,
+                canonical: 'ok:' + id,
+                provider: 'ok',
+                providerName: 'OK',
+                title: title,
+                description: decodeHtmlEntities(card.description || ''),
+                duration: durationMs > 1000 ? Math.round(durationMs / 1000) : durationMs,
+                thumbnail: thumbnail,
+                author: '',
+                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
+                qualityHint: height ? height + 'p' : (width >= 1900 ? '1080p' : width >= 1200 ? '720p' : ''),
+                year: '',
+                kind: trailerKind(title),
+                official: /официальн|official/i.test(title),
+                okId: id,
+                url: 'https://ok.ru/video/' + id,
+                transportScore: 95,
+                exactMovieMatch: false
+            };
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) {
+                seen[id] = true;
+                out.push(item);
+            }
+        }
+        out.sort(function (a, b) { return b.score - a.score; });
+        return out.slice(0, 6);
+    }
+
+    function okQualityHeight(name, url) {
+        var map = { mobile: 144, lowest: 240, low: 360, sd: 480, hd: 720, full: 1080, quad: 1440, ultra: 2160 };
+        var key = String(name || '').toLowerCase();
+        if (map[key]) return map[key];
+        var type = String(url || '').match(/[?&]type=(\d)(?:&|$)/);
+        if (type) {
+            var typeMap = { '4': 144, '0': 240, '1': 360, '2': 480, '3': 720, '5': 1080, '6': 1440, '7': 2160 };
+            if (typeMap[type[1]]) return typeMap[type[1]];
+        }
+        return qualityNumber(name);
+    }
+
+    function parseOkPlayerOptions(text, id) {
+        text = String(text || '');
+        var cursor = 0;
+        while (cursor < text.length) {
+            var at = text.indexOf('data-options=', cursor);
+            if (at < 0) break;
+            var start = at + 'data-options='.length;
+            var quote = text.charAt(start);
+            if (quote !== '"' && quote !== "'") {
+                cursor = start + 1;
+                continue;
+            }
+            var end = text.indexOf(quote, start + 1);
+            if (end < 0) break;
+            var decoded = decodeHtmlEntities(text.slice(start + 1, end));
+            if (decoded.indexOf(String(id)) >= 0) {
+                try { return JSON.parse(decoded); } catch (e) { return null; }            }
+            cursor = end + 1;
+        }
+        return null;
+    }
+
+    function okMetadataFromPlayer(player, done) {
+        if (!player || player.isExternalPlayer) return done(new Error('ok-external'));
+        var flashvars = player.flashvars || {};
+        var metadata = flashvars.metadata;
+        if (metadata && typeof metadata === 'object') return done(null, metadata);
+        if (metadata && typeof metadata === 'string') {
+            try { return done(null, JSON.parse(metadata)); } catch (e) {}
+        }
+        var metadataUrl = String(flashvars.metadataUrl || '');
+        if (!metadataUrl) return done(new Error('ok-no-metadata'));
+        try { metadataUrl = decodeURIComponent(metadataUrl); } catch (e2) {}
+        if (metadataUrl.indexOf('//') === 0) metadataUrl = 'https:' + metadataUrl;
+        else if (metadataUrl.charAt(0) === '/') metadataUrl = 'https://ok.ru' + metadataUrl;
+        if (!/^https?:\/\//i.test(metadataUrl)) return done(new Error('ok-metadata-url'));
+        var body = flashvars.location ? 'st.location=' + encodeURIComponent(flashvars.location) : 'st.location=';
+        return postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, done);
+    }
+
+    function resolveOk(item, context, done) {
+        var id = item.okId;
+        if (!id) {
+            done(new Error('ok-id'));
+            return function () {};
+        }
+        var cancelled = false;
+        var cancelCurrent = textRequest('https://ok.ru/videoembed/' + encodeURIComponent(id), RESOLVE_TIMEOUT, function (error, text) {
+            if (cancelled) return;
+            if (error || !text) return done(error || new Error('ok-player'));
+            var player = parseOkPlayerOptions(text, id);
+            if (!player) return done(new Error('ok-options'));
+            cancelCurrent = okMetadataFromPlayer(player, function (metaError, metadata) {
+                if (cancelled) return;
+                if (metaError || !metadata) return done(metaError || new Error('ok-metadata'));
+                var videos = metadata.videos || [];
+                var quality = {};
+                var best = '';
+                var bestHeight = 0;
+                for (var i = 0; i < videos.length; i++) {
+                    var stream = videos[i] || {};
+                    var streamUrl = String(stream.url || '');
+                    if (!/^https?:\/\//i.test(streamUrl)) continue;
+                    var height = okQualityHeight(stream.name, streamUrl);
+                    var label = height ? height + 'p' : (stream.name || 'Auto');
+                    quality[label] = streamUrl;
+                    if (!best || height > bestHeight) {
+                        best = streamUrl;
+                        bestHeight = height;
+                    }
+                }
+                var hls = metadata.hlsManifestUrl || metadata.ondemandHls || '';
+                if (hls && /^https?:\/\//i.test(hls)) best = hls;
+                if (!best) return done(new Error('ok-no-stream'));
+                done(null, {
+                    url: best,
+                    quality: !hls && Object.keys(quality).length > 1 ? quality : undefined,
+                    title: item.title,
+                    card: context.movie,
+                    capsule_trailer: true,
+                    capsule_source: 'ok-direct'
+                });
+            });
+        });
+        return function () {
+            cancelled = true;
+            if (cancelCurrent) cancelCurrent();
+        };
+    }
+
+    var OkProvider = {
+        id: 'ok',
+        name: 'OK',
+        tier: 'experimental',
+        search: function (context, done) {
+            if (Lampa.Storage.field('capsule_trailer_ok') === false) {
+                done(null, []);
+                return function () {};
+            }
+            var movie = context.movie || {};
+            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+            var year = yearOf(movie);
+            var key = 'ok:' + movieKey(movie);
+            var cached = cacheGet(key);
+            if (cached) {
+                done(null, cached);
+                return function () {};
+            }
+            var query = [title, year, 'трейлер'].join(' ');
+            var url = 'https://ok.ru/video/search?st.cmd=anonymVideo&st.ft=search&st.gsq=' + encodeURIComponent(query) + '&st.m=SEARCH';
+            return textRequest(url, 7000, function (error, text) {
+                if (error || !text) return done(error || new Error('ok-search'), []);
+                var items = parseOkSearch(text, movie);
+                cachePut(key, items);
+                done(null, items);
+            });
+        },
+        resolve: resolveOk
+    };
+
     function requestRutubeSearch(query, done) {
         var base = 'https://rutube.ru/api/search/video/?query=' + encodeURIComponent(query) + '&page=1&limit=20';
         var cancelled = false;
         var cancelCurrent = null;
-
-        function finish(error, data) {
-            if (cancelled) return;
-            done(error, data);
-        }
-
+        function finish(error, data) { if (!cancelled) done(error, data); }
         if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android')) {
             cancelCurrent = nativeRequest(base + '&format=json', SEARCH_TIMEOUT, finish);
         }
@@ -325,107 +1116,64 @@
                 cancelCurrent = nativeRequest(base + '&format=json', 4500, finish);
             });
         }
-
-        return function () {
-            cancelled = true;
-            if (cancelCurrent) cancelCurrent();
-        };
+        return function () { cancelled = true; if (cancelCurrent) cancelCurrent(); };
     }
 
     function normalizeRutube(raw, movie) {
-        var score = scoreRutube(raw, movie);
-        if (score < 0) return null;
-        return {
-            id: String(raw.id),
+        if (!raw || !raw.id || !raw.title) return null;
+        if (raw.is_hidden || raw.is_deleted || raw.is_locked || raw.is_audio || raw.is_paid || raw.is_livestream || raw.is_adult) return null;
+        var item = {
+            id: 'rutube:' + raw.id,
+            canonical: 'rutube:' + raw.id,
             provider: 'rutube',
             providerName: 'RUTUBE',
-            title: raw.title || 'Трейлер',
+            title: raw.title,
             description: raw.description || '',
             duration: parseInt(raw.duration, 10) || 0,
             thumbnail: raw.thumbnail_url || raw.thumbnail || '',
             author: raw.author && raw.author.name ? raw.author.name : '',
-            score: score,
             language: '',
+            qualityHint: '',
+            year: '',
+            kind: trailerKind(raw.title),
+            official: /официальн|official/i.test(String(raw.title || '')),
+            rutubeId: String(raw.id),
             url: raw.video_url || ('https://rutube.ru/video/' + raw.id + '/'),
-            embed: 'https://rutube.ru/play/embed/' + raw.id
+            embed: 'https://rutube.ru/play/embed/' + raw.id,
+            transportScore: -70,
+            exactMovieMatch: false
         };
+        item.score = scoreCandidate(item, movie, false);
+        return item.score >= 0 ? item : null;
     }
-
-    function normalizeNative(videos) {
-        var out = [];
-        var list = videos && videos.results ? videos.results : [];
-        for (var i = 0; i < list.length; i++) {
-            var raw = list[i] || {};
-            var url = raw.url || '';
-            if (!url || containsYoutube(url) || raw.youtube === true) continue;
-            if (!rutubeId(url) && !/\.(?:m3u8|mpd|mp4)(?:[?#]|$)/i.test(url)) continue;
-            out.push({
-                id: raw.key || url,
-                provider: 'native',
-                providerName: 'Lampa',
-                title: raw.name || 'Трейлер',
-                description: '',
-                duration: 0,
-                thumbnail: raw.icon || '',
-                author: '',
-                score: 1000,
-                language: raw.iso_639_1 || '',
-                url: url,
-                embed: rutubeId(url) ? 'https://rutube.ru/play/embed/' + rutubeId(url) : ''
-            });
-        }
-        return out;
-    }
-
-    var NativeProvider = {
-        id: 'native',
-        name: 'Lampa',
-        search: function (context, done) {
-            done(null, normalizeNative(context.videos));
-            return function () {};
-        },
-        resolve: function (item, context, done) {
-            done(null, {
-                url: item.url,
-                title: item.title,
-                card: context.movie,
-                capsule_trailer: true
-            });
-            return function () {};
-        }
-    };
 
     var RutubeProvider = {
         id: 'rutube',
         name: 'RUTUBE',
+        tier: 'fallback',
         search: function (context, done) {
+            if (Lampa.Storage.field('capsule_trailer_rutube') === false) {
+                done(null, []);
+                return function () {};
+            }
             var movie = context.movie || {};
-            var variants = titleVariants(movie);
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
             var original = movie.original_title || movie.original_name || '';
             var year = yearOf(movie);
-            var typeHint = mediaType(movie) === 'tv' ? 'сериал' : '';
             var queries = [];
             var cancelled = false;
             var cancelCurrent = null;
             var rawResults = [];
             var seenRaw = {};
             var index = 0;
-            var key = mediaType(movie) + ':' + (movie.id || cleanText(title)) + ':' + year;
+            var key = 'rutube:' + movieKey(movie);
             var cached = cacheGet(key);
-
             if (cached) {
                 done(null, cached);
                 return function () {};
             }
-
-            function addQuery(value) {
-                value = cleanText(value);
-                if (value && queries.indexOf(value) < 0) queries.push(value);
-            }
-
-            addQuery([title, year, typeHint, 'трейлер'].join(' '));
-            if (original && cleanText(original) !== cleanText(title)) addQuery([original, year, mediaType(movie) === 'tv' ? 'series' : '', 'trailer'].join(' '));
+            queries.push([title, year, 'трейлер'].join(' '));
+            if (original && cleanText(original) !== cleanText(title)) queries.push([original, year, 'trailer'].join(' '));
 
             function finish() {
                 if (cancelled) return;
@@ -435,7 +1183,7 @@
                     if (item) normalized.push(item);
                 }
                 normalized.sort(function (a, b) { return b.score - a.score; });
-                normalized = normalized.slice(0, 12);
+                normalized = normalized.slice(0, 7);
                 cachePut(key, normalized);
                 done(null, normalized);
             }
@@ -443,73 +1191,37 @@
             function next() {
                 if (cancelled) return;
                 if (index >= queries.length) return finish();
-                var query = queries[index++];
-
-                cancelCurrent = requestRutubeSearch(query, function (error, data) {
-                    if (cancelled) return;
-                    if (error) {
-                        cacheDrop(key);
-                        if (rawResults.length) finish();
-                        else done(error, []);
-                        return;
-                    }
-
-                    if (!data || !data.results || !data.results.length) {
-                        if (index >= queries.length && !rawResults.length) {
-                            cachePut(key, []);
-                            done(null, []);
-                        }
-                        else next();
-                        return;
-                    }
-
-                    for (var i = 0; i < data.results.length; i++) {
-                        var raw = data.results[i];
-                        if (raw && raw.id && !seenRaw[raw.id]) {
-                            seenRaw[raw.id] = true;
-                            rawResults.push(raw);
+                cancelCurrent = requestRutubeSearch(queries[index++], function (error, data) {
+                    if (!error && data && data.results) {
+                        for (var i = 0; i < data.results.length; i++) {
+                            var raw = data.results[i];
+                            if (raw && raw.id && !seenRaw[raw.id]) {
+                                seenRaw[raw.id] = true;
+                                rawResults.push(raw);
+                            }
                         }
                     }
-
-                    var confident = 0;
-                    for (var j = 0; j < rawResults.length; j++) {
-                        if (scoreRutube(rawResults[j], movie) >= 170) confident++;
-                    }
-
-                    if (confident >= 4 || index >= queries.length) finish();
-                    else next();
+                    next();
                 });
             }
-
-            if (!variants.length || !queries.length) {
-                done(null, []);
-                return function () {};
-            }
-
             next();
-
-            return function () {
-                cancelled = true;
-                if (cancelCurrent) cancelCurrent();
-            };
+            return function () { cancelled = true; if (cancelCurrent) cancelCurrent(); };
         },
         resolve: function (item, context, done) {
+            var id = item.rutubeId || rutubeId(item.url);
             var embedData = {
-                url: item.embed || ('https://rutube.ru/play/embed/' + item.id),
+                url: item.embed || ('https://rutube.ru/play/embed/' + id),
                 title: item.title,
                 card: context.movie,
                 capsule_trailer: true,
                 capsule_source: 'rutube-embed'
             };
-
             if (!(Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android'))) {
                 done(null, embedData);
                 return function () {};
             }
-
-            var url = 'https://rutube.ru/api/play/options/' + encodeURIComponent(item.id) + '/?format=json';
             var cancelled = false;
-            var cancel = nativeRequest(url, RESOLVE_TIMEOUT, function (error, data) {
+            var cancel = nativeRequest('https://rutube.ru/api/play/options/' + encodeURIComponent(id) + '/?format=json', RESOLVE_TIMEOUT, function (error, data) {
                 if (cancelled) return;
                 var hls = data && data.video_balancer && data.video_balancer.m3u8;
                 if (!error && hls && /^https?:\/\//i.test(hls)) {
@@ -519,22 +1231,17 @@
                         card: context.movie,
                         capsule_trailer: true,
                         capsule_source: 'rutube-hls',
-                        capsule_fallback: embedData.url
+                        capsule_fallback: embedData.url,
+                        capsule_fallback_source: 'rutube-embed'
                     });
                 }
-                else {
-                    done(null, embedData);
-                }
+                else done(null, embedData);
             });
-
-            return function () {
-                cancelled = true;
-                cancel();
-            };
+            return function () { cancelled = true; cancel(); };
         }
     };
 
-    var PROVIDERS = [NativeProvider, RutubeProvider];
+    var PROVIDERS = [TmdbProvider, YandexProvider, YoutubeBackendProvider, OkProvider, RutubeProvider];
 
     function registerRutubeTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
@@ -829,7 +1536,7 @@
         window.capsule_trailer_playback_fallback = true;
 
         Lampa.Player.listener.follow('start', function (data) {
-            if (!data || !data.capsule_trailer || !data.capsule_fallback || data.capsule_source !== 'rutube-hls') return;
+            if (!data || !data.capsule_trailer || !data.capsule_fallback) return;
 
             var active = true;
             var used = false;
@@ -845,21 +1552,26 @@
                 cleanup();
             }
 
+            function fallbackText() {
+                if (data.capsule_fallback_source === 'youtube-official') return 'Прямой поток YouTube недоступен, пробуем встроенный YouTube';
+                if (data.capsule_fallback_source === 'rutube-embed') return 'Прямой поток RUTUBE недоступен, пробуем встроенный плеер';
+                return 'Прямой поток недоступен, пробуем резервный способ воспроизведения';
+            }
+
             function onError(event) {
                 if (!active || used || !event || !event.fatal) return;
                 used = true;
 
-                var fallback = data.capsule_fallback;
                 var fallbackData = {
-                    url: fallback,
+                    url: data.capsule_fallback,
                     title: data.title,
                     card: data.card,
                     capsule_trailer: true,
-                    capsule_source: 'rutube-embed'
+                    capsule_source: data.capsule_fallback_source || 'fallback'
                 };
 
                 cleanup();
-                Lampa.Noty.show('RUTUBE: прямой поток недоступен, пробуем встроенный плеер');
+                Lampa.Noty.show(fallbackText());
 
                 setTimeout(function () {
                     try {
@@ -892,7 +1604,6 @@
             '.capsule-trailer__title{font-size:1.55em;font-weight:600;line-height:1.2}' +
             '.capsule-trailer__sub{font-size:.95em;opacity:.58;margin-top:.35em}' +
             '.capsule-trailer__status{font-size:.95em;opacity:.55;margin:.4em 0 1em}' +
-            '.capsule-trailer__source{font-size:.82em;font-weight:600;letter-spacing:.08em;text-transform:uppercase;opacity:.48;margin:1.45em 0 .65em}' +
             '.capsule-trailer__item{display:flex;align-items:center;padding:.72em;border-radius:.55em;margin:.25em 0;transition:background-color .12s ease,transform .12s ease;box-sizing:border-box}' +
             '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.13)}' +
             '.capsule-trailer__item.focus{transform:scale(1.012)}' +
@@ -929,12 +1640,12 @@
         var alive = true;
         var started = false;
         var last = null;
-        var providerIndex = 0;
+        var pendingProviders = 0;
         var totalResults = 0;
         var failures = [];
         var cancels = [];
         var resolvingCancel = null;
-        var sourceBlocks = {};
+        var resultSeen = {};
 
         function header() {
             var poster = imageUrl(movie);
@@ -952,18 +1663,6 @@
             );
         }
 
-        function ensureSource(item) {
-            var key = item.provider || 'other';
-            if (sourceBlocks[key]) return sourceBlocks[key].body;
-            var block = $('<div class="capsule-trailer__block"></div>');
-            block.append('<div class="capsule-trailer__source">' + escapeHtml(item.providerName || key) + '</div>');
-            var body = $('<div></div>');
-            block.append(body);
-            resultRoot.append(block);
-            sourceBlocks[key] = { block: block, body: body };
-            return body;
-        }
-
         function refreshCollection(item) {
             if (!started || !Lampa.Activity.own(self)) return;
             var enabled = Lampa.Controller.enabled();
@@ -975,12 +1674,22 @@
             }
         }
 
+        function languageLabel(item) {
+            var lang = inferLanguage(item).toLowerCase();
+            if (lang === 'ru' || lang === 'rus') return 'Русский';
+            if (lang === 'en' || lang === 'eng') return 'English';
+            return lang ? lang.toUpperCase() : '';
+        }
+
         function itemMeta(item) {
             var parts = [];
-            var lang = inferLanguage(item);
+            var kind = item.kind || trailerKind(item.title);
+            if (kind === 'teaser') parts.push('Тизер');
+            else parts.push('Трейлер');
+            var lang = languageLabel(item);
             if (lang) parts.push(lang);
+            if (item.qualityHint) parts.push(item.qualityHint);
             if (item.duration) parts.push(secondsText(item.duration));
-            if (item.author) parts.push(item.author);
             return parts;
         }
 
@@ -990,7 +1699,7 @@
                 '<img class="capsule-trailer__thumb" src="' + escapeHtml(item.thumbnail) + '" />' :
                 '<div class="capsule-trailer__thumb capsule-trailer__thumb--empty">' + ICON + '</div>';
             var el = $(
-                '<div class="capsule-trailer__item selector">' +
+                '<div class="capsule-trailer__item selector" data-score="' + escapeHtml(item.score || 0) + '">' +
                     thumb +
                     '<div class="capsule-trailer__meta">' +
                         '<div class="capsule-trailer__name">' + escapeHtml(item.title) + '</div>' +
@@ -998,6 +1707,7 @@
                     '</div>' +
                 '</div>'
             );
+
             el.on('hover:focus', function () {
                 last = el;
                 try { scroll.update(el, true); } catch (e) {}
@@ -1012,31 +1722,66 @@
 
         function appendResults(provider, items) {
             if (!alive || !items || !items.length) return;
-            var body = ensureSource(items[0]);
             for (var i = 0; i < items.length; i++) {
-                var el = makeItem(items[i], provider);
-                body.append(el);
+                var item = items[i];
+                var key = item.canonical || item.id || (provider.id + ':' + i + ':' + item.title);
+                if (resultSeen[key]) continue;
+                resultSeen[key] = true;
+                var el = makeItem(item, provider);
+                resultRoot.append(el);
                 totalResults++;
                 refreshCollection(el);
             }
         }
 
-        function providerDone(provider, error, items) {
-            if (!alive) return;
-            if (error) failures.push(provider.name);
-            appendResults(provider, items || []);
-            runNextProvider();
+        function sortResults() {
+            var nodes = resultRoot.children('.capsule-trailer__item').get();
+            nodes.sort(function (a, b) {
+                return (parseInt($(b).attr('data-score'), 10) || 0) - (parseInt($(a).attr('data-score'), 10) || 0);
+            });
+            for (var i = 0; i < nodes.length; i++) resultRoot.append(nodes[i]);
+
+            if (started && Lampa.Activity.own(self)) {
+                var enabled = Lampa.Controller.enabled();
+                if (enabled && enabled.name === COMPONENT) {
+                    Lampa.Controller.collectionSet(scroll.render());
+                    Lampa.Controller.collectionFocus(last || false, scroll.render());
+                }
+            }
         }
 
-        function runNextProvider() {
+        function providerDone(provider, error, items) {
             if (!alive) return;
-            if (providerIndex >= PROVIDERS.length) return searchFinished();
-            var provider = PROVIDERS[providerIndex++];
-            status.text('Поиск: ' + provider.name + '…');
-            var cancel = provider.search(context, function (error, items) {
-                providerDone(provider, error, items);
-            });
-            if (typeof cancel === 'function') cancels.push(cancel);
+            if (error) failures.push(provider.id);
+            appendResults(provider, items || []);
+            pendingProviders--;
+            if (pendingProviders <= 0) searchFinished();
+            else if (totalResults) status.text('Найдено: ' + totalResults + ' · поиск продолжается…');
+        }
+
+        function runProviders() {
+            if (!alive) return;
+            pendingProviders = PROVIDERS.length;
+            status.text('Ищем трейлеры…');
+
+            for (var i = 0; i < PROVIDERS.length; i++) {
+                (function (provider) {
+                    var finished = false;
+                    function finish(error, items) {
+                        if (finished) return;
+                        finished = true;
+                        providerDone(provider, error, items);
+                    }
+                    try {
+                        var cancel = provider.search(context, finish);
+                        if (typeof cancel === 'function') cancels.push(cancel);
+                    }
+                    catch (e) {
+                        log('provider search error', provider.id, e);
+                        finish(e, []);
+                    }
+                })(PROVIDERS[i]);
+            }
         }
 
         function clearSearchState() {
@@ -1044,21 +1789,20 @@
                 try { cancels[i](); } catch (e) {}
             }
             cancels = [];
-            providerIndex = 0;
+            pendingProviders = 0;
             totalResults = 0;
             failures = [];
-            sourceBlocks = {};
+            resultSeen = {};
+            last = null;
             resultRoot.empty();
         }
 
         function retry() {
-            var key = mediaType(movie) + ':' + (movie.id || cleanText(movie.title || movie.name || '')) + ':' + yearOf(movie);
-            cacheDrop(key);
+            cacheDropMovie(movie);
             clearSearchState();
-            resultRoot.empty();
             status.text('Ищем трейлеры…');
             self.activity.loader(true);
-            runNextProvider();
+            runProviders();
         }
 
         function addRetry() {
@@ -1075,9 +1819,10 @@
         function searchFinished() {
             if (!alive) return;
             self.activity.loader(false);
+            sortResults();
             if (totalResults) {
                 var text = totalResults + ' ' + (totalResults === 1 ? 'вариант' : (totalResults < 5 ? 'варианта' : 'вариантов'));
-                if (failures.length) text += ' · недоступно: ' + failures.join(', ');
+                if (failures.length) text += ' · часть источников недоступна';
                 status.text(text);
             }
             else {
@@ -1096,7 +1841,9 @@
             }
             status.text('Подготовка видео…');
             self.activity.loader(true);
-            resolvingCancel = provider.resolve(item, context, function (error, data) {
+            var settled = false;
+            var cancelResolve = provider.resolve(item, context, function (error, data) {
+                settled = true;
                 resolvingCancel = null;
                 if (!alive) return;
                 self.activity.loader(false);
@@ -1105,7 +1852,7 @@
                     Lampa.Noty.show('CAPSULE Trailer: видео недоступно');
                     return;
                 }
-                status.text('Запуск: ' + (item.providerName || provider.name));
+                status.text('Запуск трейлера…');
                 try {
                     Lampa.Player.play(data);
                 }
@@ -1114,6 +1861,7 @@
                     Lampa.Noty.show('CAPSULE Trailer: ошибка запуска видео');
                 }
             });
+            resolvingCancel = settled ? null : (typeof cancelResolve === 'function' ? cancelResolve : null);
         }
 
         this.create = function () {
@@ -1124,7 +1872,7 @@
             html.append(scroll.render());
             status.text('Ищем трейлеры…');
             this.activity.loader(true);
-            runNextProvider();
+            runProviders();
             return this.render();
         };
 
@@ -1179,11 +1927,75 @@
         };
     }
 
+    function setupSettings() {
+        if (!Lampa.SettingsApi || typeof Lampa.SettingsApi.addComponent !== 'function' || typeof Lampa.SettingsApi.addParam !== 'function') return;
+
+        Lampa.SettingsApi.addComponent({
+            component: 'capsule_trailer_settings',
+            name: 'CAPSULE Trailer',
+            icon: ICON
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_youtube_backend',
+                type: 'input',
+                default: ''
+            },
+            field: {
+                name: 'YouTube backend',
+                description: 'Необязательно. Адрес собственного Invidious или Piped backend без конечного слеша. Публичные случайные proxy не используются.'
+            },
+            onChange: function () {
+                backendDetected = '';
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_yandex',
+                type: 'trigger',
+                default: true
+            },
+            field: {
+                name: 'Yandex Video',
+                description: 'Экспериментальный источник русских трейлеров. При ошибке остальные источники продолжают работать.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_ok',
+                type: 'trigger',
+                default: true
+            },
+            field: {
+                name: 'OK.ru',
+                description: 'Экспериментальный источник с большим русскоязычным каталогом. Используются только публичные ролики без авторизации.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_rutube',
+                type: 'trigger',
+                default: true
+            },
+            field: {
+                name: 'RUTUBE fallback',
+                description: 'Резервный источник. Имеет низкий приоритет из-за рекламы и неполного покрытия.'
+            }
+        });
+    }
+
     function addCardButton(event) {
         if (!event || event.type !== 'complite' || !event.data || !event.data.movie || !event.object || !event.object.activity) return;
         var movie = event.data.movie;
         if (movie.adult) return;
-
         var render = event.object.activity.render();
         if (!render || !render.find) return;
         if (render.find('.view--capsule-trailer').length) return;
@@ -1192,7 +2004,7 @@
         if (!container.length) return;
 
         var button = $('' +
-            '<div class="full-start__button selector view--capsule-trailer" data-subtitle="CAPSULE Trailer · RUTUBE">' +
+            '<div class="full-start__button selector view--capsule-trailer" data-subtitle="CAPSULE Trailer · агрегатор">' +
                 ICON +
                 '<span>Трейлеры</span>' +
             '</div>'
@@ -1217,6 +2029,7 @@
 
     function init() {
         addStyles();
+        setupSettings();
         registerRutubeTube();
         registerPlaybackFallback();
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, TrailerComponent);
