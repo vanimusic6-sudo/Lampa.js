@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.5.0';
+    var VERSION = '2.6.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v7';
+    var CACHE_KEY = 'capsule_trailer_cache_v8';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -1378,6 +1378,14 @@
             },
             create: function (callVideo) {
                 var object = $('<div class="capsule-kinopoisk-player"></div>');
+                var loader = $('' +
+                    '<div class="capsule-kinopoisk-loader">' +
+                        '<div class="capsule-kinopoisk-loader__spinner"></div>' +
+                        '<div class="capsule-kinopoisk-loader__text">Загрузка трейлера…</div>' +
+                    '</div>'
+                );
+                object.append(loader);
+
                 var video = object[0];
                 var listener = Lampa.Subscribe();
                 var frame = null;
@@ -1391,6 +1399,17 @@
                 var wantedPlay = false;
                 var ended = false;
                 var initTimer = null;
+                var loaderFallbackTimer = null;
+
+                function setLoader(status, text) {
+                    if (text) loader.find('.capsule-kinopoisk-loader__text').text(text);
+                    loader.toggleClass('hide', !status);
+                }
+
+                function hideLoader() {
+                    clearTimeout(loaderFallbackTimer);
+                    setLoader(false);
+                }
 
                 function post(method, data) {
                     if (!frame || !frame.contentWindow) return;
@@ -1420,18 +1439,46 @@
                     var message = parseMessage(event);
                     if (!message) return;
 
-                    var type = String(message.event || message.type || '').toLowerCase();
+                    var payload = message;
+                    if (message.data && typeof message.data === 'object') payload = message.data;
+
+                    var detail = payload;
+                    if (payload && payload.data && typeof payload.data === 'object') detail = payload.data;
+
+                    function value(name) {
+                        if (detail && typeof detail[name] !== 'undefined') return detail[name];
+                        if (payload && typeof payload[name] !== 'undefined') return payload[name];
+                        return message[name];
+                    }
+
+                    var type = String(
+                        message.event || message.type ||
+                        (payload && (payload.event || payload.type)) ||
+                        (detail && (detail.event || detail.type)) || ''
+                    ).toLowerCase();
+
+                    var eventTime = value('time');
+                    var eventDuration = value('duration');
+
+                    if (typeof eventTime !== 'undefined' && isFinite(Number(eventTime))) {
+                        current = Math.max(0, Number(eventTime) || 0);
+                    }
+                    if (typeof eventDuration !== 'undefined' && Number(eventDuration) > 0) {
+                        duration = Number(eventDuration);
+                    }
 
                     if (type === 'inited' || type === 'ready' || type === 'player:ready') {
                         var firstReady = !ready;
                         ready = true;
                         clearTimeout(initTimer);
+                        setLoader(true, 'Запускаем трейлер…');
                         if (firstReady) {
                             listener.send('canplay');
                             listener.send('loadeddata');
                         }
                         post('setVolume', { volume: muted ? 0 : volume });
                         if (wantedPlay) post('play');
+                        if (duration > 0) listener.send('timeupdate');
                         return;
                     }
 
@@ -1440,8 +1487,7 @@
                         clearTimeout(initTimer);
                         ended = false;
                         paused = false;
-                        if (typeof message.time !== 'undefined') current = Number(message.time) || 0;
-                        if (typeof message.duration !== 'undefined') duration = Number(message.duration) || duration;
+                        hideLoader();
                         listener.send('playing');
                         listener.send('timeupdate');
                         return;
@@ -1449,30 +1495,41 @@
 
                     if (type === 'paused' || type === 'pause') {
                         paused = true;
-                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
                         listener.send('pause');
                         listener.send('timeupdate');
                         return;
                     }
 
                     if (type === 'ended' || type === 'finished') {
-                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
+                        hideLoader();
                         sendEnded();
                         return;
                     }
 
                     if (type === 'timeupdate' || type === 'progress') {
-                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
-                        if (typeof message.duration !== 'undefined') duration = Number(message.duration) || duration;
+                        if (current > 0 || duration > 0) hideLoader();
                         listener.send('timeupdate');
                         return;
                     }
 
+                    if (type === 'bufferingstarted' || type === 'buffering') {
+                        setLoader(true, 'Буферизация трейлера…');
+                        listener.send('waiting');
+                        return;
+                    }
+
+                    if (type === 'bufferingended') {
+                        hideLoader();
+                        if (!paused) listener.send('playing');
+                        return;
+                    }
+
                     if (type === 'error' || type === 'fatal') {
+                        hideLoader();
                         paused = true;
                         video.error = {
-                            code: message.code || 'kinopoisk',
-                            message: message.message || 'Kinopoisk widget playback error'
+                            code: value('code') || 'kinopoisk',
+                            message: value('message') || 'Kinopoisk widget playback error'
                         };
                         listener.send('error', { error: video.error, fatal: true });
                     }
@@ -1501,6 +1558,12 @@
                             listener.send('loadeddata');
                         }
 
+                        setLoader(true, 'Запускаем трейлер…');
+                        clearTimeout(loaderFallbackTimer);
+                        loaderFallbackTimer = setTimeout(function () {
+                            hideLoader();
+                        }, 4500);
+
                         post('setVolume', { volume: muted ? 0 : volume });
 
                         if (wantedPlay) {
@@ -1510,7 +1573,8 @@
                         }
                     };
 
-                    object.empty().append(frame);
+                    object.append(frame);
+                    object.append(loader);
 
                     initTimer = setTimeout(function () {
                         if (ready || !frame) return;
@@ -1535,7 +1599,9 @@
                     configurable: true,
                     set: function (value) {
                         current = Math.max(0, Number(value) || 0);
+                        if (duration > 0) current = Math.min(current, duration);
                         post('seek', { time: current });
+                        listener.send('timeupdate');
                     },
                     get: function () { return current; }
                 });
@@ -1601,6 +1667,7 @@
                 video.size = function () {};
                 video.destroy = function () {
                     clearTimeout(initTimer);
+                    clearTimeout(loaderFallbackTimer);
                     window.removeEventListener('message', onMessage);
                     try { if (frame && frame.parentNode) frame.parentNode.removeChild(frame); } catch (e) {}
                     frame = null;
@@ -1745,6 +1812,12 @@
         style.textContent = '' +
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box}' +
             '.capsule-kinopoisk-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
+            '.capsule-kinopoisk-player iframe{position:absolute;top:0;right:0;bottom:0;left:0;z-index:1}' +
+            '.capsule-kinopoisk-loader{position:absolute;top:0;right:0;bottom:0;left:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;pointer-events:none;transition:opacity .16s ease}' +
+            '.capsule-kinopoisk-loader.hide{opacity:0;visibility:hidden}' +
+            '.capsule-kinopoisk-loader__spinner{width:2.8em;height:2.8em;border:.22em solid rgba(255,255,255,.22);border-top-color:#fff;border-radius:50%;animation:capsule-kinopoisk-spin .8s linear infinite}' +
+            '.capsule-kinopoisk-loader__text{font-size:1em;margin-top:1em;opacity:.72}' +
+            '@keyframes capsule-kinopoisk-spin{to{transform:rotate(360deg)}}' +
             '.capsule-trailer{padding:1.8em 2.2em 3em;box-sizing:border-box;max-width:78em;margin:0 auto;color:inherit}' +
             '.capsule-trailer__head{display:flex;align-items:center;margin:0 0 1.5em}' +
             '.capsule-trailer__poster{width:4.2em;height:6.2em;object-fit:cover;border-radius:.45em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1.1em}' +
