@@ -13,8 +13,7 @@
  * Discovery / playback layers:
  * - Direct trailer URLs already present in Lampa movie metadata.
  * - Kinopoisk API Unofficial metadata + Kinopoisk trailer widget stream resolver.
- * - Yandex Video/VH and OK.ru as isolated experimental providers for Russian trailers.
- * - RUTUBE is a low-priority fallback, not the primary source.
+ * - OK.ru is the primary trailer source; Yandex Video/VH is an optional experimental provider.
  *
  */
 (function () {
@@ -23,13 +22,15 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.2.0';
+    var VERSION = '2.3.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v4';
+    var CACHE_KEY = 'capsule_trailer_cache_v5';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
     var RESOLVE_TIMEOUT = 7000;
+    var AUTO_SCORE_MIN = 260;
+    var AUTO_SETTLE_MS = 420;
     var jsonpSerial = 0;
 
     var ICON = '' +
@@ -104,11 +105,6 @@
         return text ? text.split(' ') : [];
     }
 
-    function rutubeId(url) {
-        var match = String(url || '').match(/rutube\.ru\/(?:play\/embed|video(?:\/private)?|shorts)\/([0-9a-z]{32})/i);
-        return match ? match[1] : '';
-    }
-
     function secondsText(value) {
         var n = parseInt(value, 10);
         if (!n || n < 1) return '';
@@ -128,6 +124,72 @@
     function isTrailerTitle(title) {
         var text = cleanText(title);
         return /(^| )(трейлер|trailer|тизер|teaser)( |$)/.test(text);
+    }
+
+    function noisyTrailerTitle(title, movie) {
+        var text = cleanText(title);
+        if (!text) return true;
+
+        if (/(обзор|реакци|разбор|рецензи|мнение|объяснен|пасхалк|теори|интервью|саундтрек|soundtrack|review|reaction|breakdown|interview|behind the scenes|making of|featurette|fan made|fanmade|concept trailer|concept teaser|gameplay|walkthrough)/.test(text)) return true;
+        if (/(полный фильм|фильм полностью|full movie|watch online|смотреть онлайн)/.test(text)) return true;
+        if (/(отрывок|фрагмент|сцена|клип|clip|scene|tv spot)/.test(text)) return true;
+
+        if (mediaType(movie) !== 'tv' && /(сезон|season|серия|эпизод|episode)/.test(text)) return true;
+        if (mediaType(movie) === 'tv' && /(серия|эпизод|episode\s*\d+)/.test(text)) return true;
+
+        return false;
+    }
+
+    function meaningfulTitleWords(value) {
+        var stop = {
+            'the':1,'a':1,'an':1,'of':1,'and':1,'or':1,'to':1,'in':1,'on':1,'for':1,
+            'и':1,'в':1,'во':1,'на':1,'с':1,'со':1,'к':1,'ко':1,'из':1,'по':1,'для':1
+        };
+        var input = words(value);
+        var out = [];
+        for (var i = 0; i < input.length; i++) {
+            if (input[i].length > 1 && !stop[input[i]]) out.push(input[i]);
+        }
+        return out;
+    }
+
+    function semanticTrailerKey(item) {
+        var generic = {
+            'трейлер':1,'trailer':1,'тизер':1,'teaser':1,'официальный':1,'official':1,
+            'русский':1,'russian':1,'дублированный':1,'дублирован':1,'dubbed':1,
+            'hd':1,'uhd':1,'fullhd':1,'4k':1,'2160p':1,'1440p':1,'1080p':1,'720p':1,'480p':1
+        };
+        var input = words(item && item.title || '');
+        var out = [];
+        for (var i = 0; i < input.length; i++) {
+            var token = input[i];
+            if (generic[token]) continue;
+            if (/^(?:19|20)\d{2}$/.test(token)) continue;
+            out.push(token);
+        }
+        return out.join(' ') || cleanText(item && item.title || '');
+    }
+
+    function dedupeCandidates(items) {
+        var map = {};
+        var out = [];
+        for (var i = 0; i < (items || []).length; i++) {
+            var item = items[i];
+            var key = semanticTrailerKey(item);
+            if (!key) key = item.canonical || item.id || String(i);
+            if (!map[key]) {
+                map[key] = item;
+                out.push(item);
+            }
+            else if ((item.score || 0) > (map[key].score || 0)) {
+                var old = map[key];
+                var at = out.indexOf(old);
+                if (at >= 0) out[at] = item;
+                map[key] = item;
+            }
+        }
+        out.sort(function (a, b) { return (b.score || 0) - (a.score || 0); });
+        return out;
     }
 
     function explicitYears(text) {
@@ -247,7 +309,12 @@
         var duration = parseInt(item.duration, 10) || 0;
         var kind = item.kind || trailerKind(item.title);
         if (!kind && !exactMovieMatch) return -9999;
-        if (duration && (duration < 12 || duration > 900)) return -9999;
+        if (!exactMovieMatch && noisyTrailerTitle(item.title, movie)) return -9999;
+
+        if (duration) {
+            if (kind === 'teaser' && (duration < 8 || duration > (exactMovieMatch ? 360 : 240))) return -9999;
+            if (kind !== 'teaser' && (duration < 15 || duration > (exactMovieMatch ? 600 : 420))) return -9999;
+        }
 
         var score = exactMovieMatch ? 260 : 0;
         var variants = titleVariants(movie);
@@ -262,7 +329,11 @@
             if (value > best) best = value;
         }
 
-        if (!exactMovieMatch && best < 70) return -9999;
+        if (!exactMovieMatch) {
+            var meaningful = meaningfulTitleWords(movie && (movie.title || movie.name || movie.original_title || movie.original_name) || '');
+            if (best < 80) return -9999;
+            if (meaningful.length <= 2 && best < 150) return -9999;
+        }
         score += best;
 
         var year = yearOf(movie);
@@ -463,7 +534,6 @@
         if (source === 'ok') headers.Referer = 'https://ok.ru/';
         else if (source === 'yandex') headers.Referer = 'https://yandex.ru/';
         else if (source === 'kinopoisk') headers.Referer = 'https://www.kinopoisk.ru/';
-        else if (source === 'rutube') headers.Referer = 'https://rutube.ru/';
         return headers;
     }
 
@@ -701,7 +771,7 @@
             out.push(item);
         }
 
-        out.sort(function (a, b) { return b.score - a.score; });
+        out = dedupeCandidates(out);
         return out.slice(0, 8);
     }
 
@@ -913,7 +983,7 @@
             }
             pos = valueEnd + 1;
         }
-        out.sort(function (a, b) { return b.score - a.score; });
+        out = dedupeCandidates(out);
         return out.slice(0, 3);
     }
 
@@ -1025,7 +1095,7 @@
         name: 'Yandex Video',
         tier: 'experimental',
         search: function (context, done) {
-            if (!settingEnabled('capsule_trailer_yandex', true)) {
+            if (!settingEnabled('capsule_trailer_yandex', false)) {
                 done(null, []);
                 return function () {};
             }
@@ -1172,7 +1242,7 @@
                 out.push(item);
             }
         }
-        out.sort(function (a, b) { return b.score - a.score; });
+        out = dedupeCandidates(out);
         return out.slice(0, 6);
     }
 
@@ -1323,10 +1393,6 @@
         name: 'OK',
         tier: 'experimental',
         search: function (context, done) {
-            if (!settingEnabled('capsule_trailer_ok', true)) {
-                done(null, []);
-                return function () {};
-            }
             var movie = context.movie || {};
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
             var original = movie.original_title || movie.original_name || '';
@@ -1388,150 +1454,7 @@
         resolve: resolveOk
     };
 
-    function requestRutubeSearch(query, done) {
-        var base = 'https://rutube.ru/api/search/video/?query=' + encodeURIComponent(query) + '&page=1&limit=20';
-        var cancelled = false;
-        var cancelCurrent = null;
-        function finish(error, data) { if (!cancelled) done(error, data); }
-        if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android')) {
-            cancelCurrent = nativeRequest(base + '&format=json', SEARCH_TIMEOUT, finish);
-        }
-        else {
-            cancelCurrent = jsonp(base, 5500, function (error, data) {
-                if (!error && data) return finish(null, data);
-                if (cancelled) return;
-                cancelCurrent = nativeRequest(base + '&format=json', 4500, finish);
-            });
-        }
-        return function () { cancelled = true; if (cancelCurrent) cancelCurrent(); };
-    }
-
-    function normalizeRutube(raw, movie) {
-        if (!raw || !raw.id || !raw.title) return null;
-        if (raw.is_hidden || raw.is_deleted || raw.is_locked || raw.is_audio || raw.is_paid || raw.is_livestream || raw.is_adult) return null;
-        var item = {
-            id: 'rutube:' + raw.id,
-            canonical: 'rutube:' + raw.id,
-            provider: 'rutube',
-            providerName: 'RUTUBE',
-            title: raw.title,
-            description: raw.description || '',
-            duration: parseInt(raw.duration, 10) || 0,
-            thumbnail: raw.thumbnail_url || raw.thumbnail || '',
-            author: raw.author && raw.author.name ? raw.author.name : '',
-            language: '',
-            qualityHint: '',
-            year: '',
-            kind: trailerKind(raw.title),
-            official: /официальн|official/i.test(String(raw.title || '')),
-            rutubeId: String(raw.id),
-            url: raw.video_url || ('https://rutube.ru/video/' + raw.id + '/'),
-            embed: 'https://rutube.ru/play/embed/' + raw.id,
-            transportScore: -70,
-            exactMovieMatch: false
-        };
-        item.score = scoreCandidate(item, movie, false);
-        return item.score >= 0 ? item : null;
-    }
-
-    var RutubeProvider = {
-        id: 'rutube',
-        name: 'RUTUBE',
-        tier: 'fallback',
-        search: function (context, done) {
-            if (!settingEnabled('capsule_trailer_rutube', true)) {
-                done(null, []);
-                return function () {};
-            }
-            var movie = context.movie || {};
-            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
-            var original = movie.original_title || movie.original_name || '';
-            var year = yearOf(movie);
-            var queries = [];
-            var cancelled = false;
-            var cancelCurrent = null;
-            var rawResults = [];
-            var seenRaw = {};
-            var index = 0;
-            var key = 'rutube:' + movieKey(movie);
-            var cached = cacheGet(key);
-            if (cached) {
-                done(null, cached);
-                return function () {};
-            }
-            queries.push([title, year, 'трейлер'].join(' '));
-            if (original && cleanText(original) !== cleanText(title)) queries.push([original, year, 'trailer'].join(' '));
-
-            function finish() {
-                if (cancelled) return;
-                var normalized = [];
-                for (var i = 0; i < rawResults.length; i++) {
-                    var item = normalizeRutube(rawResults[i], movie);
-                    if (item) normalized.push(item);
-                }
-                normalized.sort(function (a, b) { return b.score - a.score; });
-                normalized = normalized.slice(0, 7);
-                cachePut(key, normalized);
-                done(null, normalized);
-            }
-
-            function next() {
-                if (cancelled) return;
-                if (index >= queries.length) return finish();
-                cancelCurrent = requestRutubeSearch(queries[index++], function (error, data) {
-                    if (!error && data && data.results) {
-                        for (var i = 0; i < data.results.length; i++) {
-                            var raw = data.results[i];
-                            if (raw && raw.id && !seenRaw[raw.id]) {
-                                seenRaw[raw.id] = true;
-                                rawResults.push(raw);
-                            }
-                        }
-                    }
-                    next();
-                });
-            }
-            next();
-            return function () { cancelled = true; if (cancelCurrent) cancelCurrent(); };
-        },
-        resolve: function (item, context, done) {
-            var id = item.rutubeId || rutubeId(item.url);
-            var embedData = {
-                url: item.embed || ('https://rutube.ru/play/embed/' + id),
-                title: item.title,
-                card: context.movie,
-                capsule_trailer: true,
-                capsule_source: 'rutube-embed'
-            };
-            if (!(Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android'))) {
-                done(null, embedData);
-                return function () {};
-            }
-            var cancelled = false;
-            var cancel = nativeRequest('https://rutube.ru/api/play/options/' + encodeURIComponent(id) + '/?format=json', RESOLVE_TIMEOUT, function (error, data) {
-                if (cancelled) return;
-                var hls = data && data.video_balancer && data.video_balancer.m3u8;
-                if (!error && hls && /^https?:\/\//i.test(hls)) {
-                    done(null, {
-                        url: hls,
-                        title: item.title,
-                        card: context.movie,
-                        capsule_trailer: true,
-                        capsule_source: 'rutube-hls',
-                        capsule_fallback: embedData.url,
-                        capsule_fallback_source: 'rutube-embed',
-                        hls_type: 'native',
-                        headers: playbackHeaders('rutube'),
-                        hls_manifest_timeout: 15000
-                    });
-                }
-                else done(null, embedData);
-            });
-            return function () { cancelled = true; cancel(); };
-        }
-    };
-
-    var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, YandexProvider, OkProvider, RutubeProvider];
+    var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, OkProvider, YandexProvider];
 
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
@@ -1565,293 +1488,6 @@
 
         if (Lampa.PlayerVideo.registerTube(registration)) {
             window.capsule_trailer_media_tube = registration;
-        }
-    }
-
-    function registerRutubeTube() {
-        if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
-        if (window.capsule_trailer_rutube_tube) return;
-
-        var registration = {
-            name: 'CAPSULE RUTUBE',
-            verify: function (src) {
-                return /^https?:\/\/(?:www\.)?rutube\.ru\/(?:play\/embed|video(?:\/private)?|shorts)\/[0-9a-z]{32}/i.test(String(src || ''));
-            },
-            create: function (callVideo) {
-                var object = $('<div class="capsule-rutube-player"></div>');
-                var video = object[0];
-                var listener = Lampa.Subscribe();
-                var frame = null;
-                var streamUrl = '';
-                var current = 0;
-                var duration = 0;
-                var paused = true;
-                var volume = 1;
-                var muted = false;
-                var ready = false;
-                var wantedPlay = false;
-                var ended = false;
-                var qualityList = [];
-                var currentQuality = 0;
-                var playTimer = null;
-
-                function post(type, data) {
-                    if (!frame || !frame.contentWindow) return;
-                    try {
-                        frame.contentWindow.postMessage(JSON.stringify({ type: type, data: data || {} }), '*');
-                    }
-                    catch (e) {}
-                }
-
-                function sendEnded() {
-                    if (ended) return;
-                    ended = true;
-                    paused = true;
-                    listener.send('ended');
-                }
-
-                function levels() {
-                    if (!qualityList.length || !Lampa.PlayerVideo.listener || !Lampa.PlayerVideo.listener.send) return;
-                    var result = [];
-                    for (var i = 0; i < qualityList.length; i++) {
-                        (function (height) {
-                            var level = {
-                                title: height + 'p',
-                                quality: height + 'p',
-                                height: height,
-                                selected: parseInt(currentQuality, 10) === parseInt(height, 10)
-                            };
-                            Object.defineProperty(level, 'enabled', {
-                                configurable: true,
-                                set: function (value) {
-                                    if (!value) return;
-                                    currentQuality = height;
-                                    post('player:changeQuality', { quality: String(height) });
-                                },
-                                get: function () {}
-                            });
-                            result.push(level);
-                        })(qualityList[i]);
-                    }
-                    Lampa.PlayerVideo.listener.send('levels', {
-                        levels: result,
-                        current: currentQuality ? currentQuality + 'p' : 'AUTO'
-                    });
-                }
-
-                function parseMessage(event) {
-                    if (!frame || event.source !== frame.contentWindow) return null;
-                    if (event.origin && event.origin !== 'https://rutube.ru') return null;
-                    var message = event.data;
-                    if (typeof message === 'string') {
-                        try { message = JSON.parse(message); } catch (e) { return null; }
-                    }
-                    return message && message.type ? message : null;
-                }
-
-                function onMessage(event) {
-                    var message = parseMessage(event);
-                    if (!message) return;
-                    var data = message.data || {};
-
-                    if (message.type === 'player:ready' || message.type === 'player:init') {
-                        var firstReady = !ready;
-                        ready = true;
-                        post('player:hideControls');
-                        post(muted ? 'player:mute' : 'player:unMute');
-                        post('player:setVolume', { volume: volume });
-                        if (firstReady) {
-                            listener.send('canplay');
-                            listener.send('loadeddata');
-                        }
-                        if (wantedPlay) post('player:play');
-                        return;
-                    }
-
-                    if (message.type === 'player:durationChange') {
-                        duration = Number(data.duration) || duration;
-                        listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (message.type === 'player:currentTime') {
-                        current = Number(data.time) || 0;
-                        listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (message.type === 'player:changeState') {
-                        if (data.state === 'playing') {
-                            ended = false;
-                            paused = false;
-                            clearTimeout(playTimer);
-                            listener.send('playing');
-                        }
-                        else if (data.state === 'paused') {
-                            paused = true;
-                            listener.send('pause');
-                        }
-                        else if (data.state === 'stopped') {
-                            sendEnded();
-                        }
-                        return;
-                    }
-
-                    if (message.type === 'player:buffering') {
-                        listener.send('waiting');
-                        return;
-                    }
-
-                    if (message.type === 'player:qualityList') {
-                        qualityList = data.list && data.list.slice ? data.list.slice(0) : [];
-                        qualityList.sort(function (a, b) { return parseInt(b, 10) - parseInt(a, 10); });
-                        levels();
-                        return;
-                    }
-
-                    if (message.type === 'player:currentQuality') {
-                        var quality = data.quality || {};
-                        currentQuality = quality.isAutoQuality ? 0 : (parseInt(quality.height || quality.quality, 10) || 0);
-                        levels();
-                        return;
-                    }
-
-                    if (message.type === 'player:volumeChange') {
-                        if (typeof data.volume !== 'undefined') volume = Number(data.volume) || 0;
-                        if (typeof data.muted !== 'undefined') muted = !!data.muted;
-                        return;
-                    }
-
-                    if (message.type === 'player:playComplete') {
-                        sendEnded();
-                        return;
-                    }
-
-                    if (message.type === 'player:error') {
-                        paused = true;
-                        video.error = {
-                            code: data.code || 'rutube',
-                            message: data.text || 'RUTUBE playback error'
-                        };
-                        listener.send('error', { error: video.error, fatal: true });
-                    }
-                }
-
-                function createFrame(id) {
-                    if (frame) return;
-                    frame = document.createElement('iframe');
-                    frame.src = 'https://rutube.ru/play/embed/' + encodeURIComponent(id) + '?getPlayOptions=duration,title';
-                    frame.setAttribute('frameborder', '0');
-                    frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
-                    frame.setAttribute('allowfullscreen', 'true');
-                    frame.style.width = '100%';
-                    frame.style.height = '100%';
-                    frame.style.border = '0';
-                    frame.style.display = 'block';
-                    frame.style.pointerEvents = 'none';
-                    object.empty().append(frame);
-                }
-
-                Object.defineProperty(video, 'src', {
-                    configurable: true,
-                    set: function (value) { streamUrl = String(value || ''); },
-                    get: function () { return streamUrl; }
-                });
-                Object.defineProperty(video, 'currentTime', {
-                    configurable: true,
-                    set: function (value) {
-                        current = Math.max(0, Number(value) || 0);
-                        post('player:setCurrentTime', { time: current });
-                    },
-                    get: function () { return current; }
-                });
-                Object.defineProperty(video, 'duration', {
-                    configurable: true,
-                    get: function () { return duration; }
-                });
-                Object.defineProperty(video, 'paused', {
-                    configurable: true,
-                    get: function () { return paused; }
-                });
-                Object.defineProperty(video, 'volume', {
-                    configurable: true,
-                    set: function (value) {
-                        volume = Math.max(0, Math.min(1, Number(value) || 0));
-                        if (ready) post('player:setVolume', { volume: volume });
-                    },
-                    get: function () { return volume; }
-                });
-                Object.defineProperty(video, 'muted', {
-                    configurable: true,
-                    set: function (value) {
-                        muted = !!value;
-                        if (ready) post(muted ? 'player:mute' : 'player:unMute');
-                    },
-                    get: function () { return muted; }
-                });
-                Object.defineProperty(video, 'videoWidth', {
-                    configurable: true,
-                    get: function () {
-                        if (currentQuality >= 2160) return 3840;
-                        if (currentQuality >= 1440) return 2560;
-                        if (currentQuality >= 1080) return 1920;
-                        if (currentQuality >= 720) return 1280;
-                        return 854;
-                    }
-                });
-                Object.defineProperty(video, 'videoHeight', {
-                    configurable: true,
-                    get: function () { return currentQuality || 480; }
-                });
-                Object.defineProperty(video, 'audioTracks', { configurable: true, get: function () { return []; } });
-                Object.defineProperty(video, 'textTracks', { configurable: true, get: function () { return []; } });
-
-                video.canPlayType = function () { return true; };
-                video.addEventListener = listener.follow.bind(listener);
-                video.load = function () {
-                    var id = rutubeId(streamUrl);
-                    if (!id) {
-                        video.error = { code: 'rutube-url', message: 'Invalid RUTUBE URL' };
-                        listener.send('error', { error: video.error, fatal: true });
-                        return;
-                    }
-                    createFrame(id);
-                };
-                video.play = function () {
-                    wantedPlay = true;
-                    if (ready) post('player:play');
-                    clearTimeout(playTimer);
-                    playTimer = setTimeout(function () {
-                        if (wantedPlay && paused && !ended) {
-                            log('RUTUBE did not report playing state yet');
-                        }
-                    }, 12000);
-                };
-                video.pause = function () {
-                    wantedPlay = false;
-                    paused = true;
-                    if (ready) post('player:pause');
-                };
-                video.resize = function () {};
-                video.size = function () {};
-                video.destroy = function () {
-                    clearTimeout(playTimer);
-                    try { post('player:remove'); } catch (e) {}
-                    window.removeEventListener('message', onMessage);
-                    try { if (frame && frame.parentNode) frame.parentNode.removeChild(frame); } catch (e2) {}
-                    frame = null;
-                    listener.destroy();
-                    object.remove();
-                };
-
-                window.addEventListener('message', onMessage);
-                callVideo(video);
-                return object;
-            }
-        };
-
-        if (Lampa.PlayerVideo.registerTube(registration)) {
-            window.capsule_trailer_rutube_tube = registration;
         }
     }
 
@@ -1908,11 +1544,7 @@
                         };
 
                         cleanup();
-                        Lampa.Noty.show(
-                            data.capsule_fallback_source === 'rutube-embed' ?
-                                'Прямой поток RUTUBE недоступен, пробуем встроенный плеер' :
-                                'Прямой поток недоступен, пробуем резервный способ воспроизведения'
-                        );
+                        Lampa.Noty.show('Прямой поток недоступен, пробуем резервный способ воспроизведения');
 
                         setTimeout(function () {
                             try {
@@ -1995,7 +1627,9 @@
             '.capsule-trailer__line{font-size:.86em;opacity:.56;margin-top:.34em}' +
             '.capsule-trailer__empty{padding:2em 0;opacity:.65;font-size:1.05em}' +
             '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.72em 1.05em;border-radius:.5em;background:rgba(255,255,255,.1);margin-top:.8em}' +
-            '.capsule-rutube-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
+            '.capsule-trailer__results{padding-bottom:4em}' +
+            'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:10em}' +
+            'body.true--mobile.orientation--landscape .capsule-trailer{padding-right:10em}' +
             '@media(max-width:700px){.capsule-trailer{padding:1.1em 1em 2.5em}.capsule-trailer__head{margin-bottom:1em}.capsule-trailer__poster{width:3.4em;height:5em;margin-right:.8em}.capsule-trailer__title{font-size:1.25em}.capsule-trailer__item{padding:.6em .2em;border-radius:.4em}.capsule-trailer__thumb{width:7.8em;height:4.39em;margin-right:.75em}.capsule-trailer__name{font-size:.98em}}';
         document.head.appendChild(style);
     }
@@ -2027,6 +1661,10 @@
         var cancels = [];
         var resolvingCancel = null;
         var resultSeen = {};
+        var semanticSeen = {};
+        var bestFound = null;
+        var autoTimer = null;
+        var autoStarted = false;
 
         function header() {
             var poster = imageUrl(movie);
@@ -2101,18 +1739,48 @@
             return el;
         }
 
+        function scheduleAutoPlay() {
+            if (!settingEnabled('capsule_trailer_autoplay', false) || autoStarted || !bestFound || bestFound.item.score < AUTO_SCORE_MIN) return;
+            clearTimeout(autoTimer);
+            autoTimer = setTimeout(function () {
+                if (!alive || autoStarted || !bestFound || bestFound.item.score < AUTO_SCORE_MIN) return;
+                autoStarted = true;
+                status.text('Лучший трейлер найден · запуск…');
+                play(bestFound.item, bestFound.provider);
+            }, AUTO_SETTLE_MS);
+        }
+
         function appendResults(provider, items) {
             if (!alive || !items || !items.length) return;
             for (var i = 0; i < items.length; i++) {
                 var item = items[i];
                 item.score = scoreCandidate(item, movie, item.exactMovieMatch === true);
                 if (item.score < 0) continue;
+
                 var key = item.canonical || item.id || (provider.id + ':' + i + ':' + item.title);
                 if (resultSeen[key]) continue;
+
+                var semantic = semanticTrailerKey(item);
+                var duplicate = semantic ? semanticSeen[semantic] : null;
+                if (duplicate && duplicate.score >= item.score) continue;
+
+                if (duplicate) {
+                    try { duplicate.el.remove(); } catch (e) {}
+                    if (duplicate.key) delete resultSeen[duplicate.key];
+                    totalResults = Math.max(0, totalResults - 1);
+                }
+
                 resultSeen[key] = true;
                 var el = makeItem(item, provider);
                 resultRoot.append(el);
                 totalResults++;
+
+                if (semantic) semanticSeen[semantic] = { score: item.score, el: el, key: key };
+                if (!bestFound || item.score > bestFound.item.score) {
+                    bestFound = { item: item, provider: provider };
+                    scheduleAutoPlay();
+                }
+
                 refreshCollection(el);
             }
         }
@@ -2176,6 +1844,11 @@
             totalResults = 0;
             failures = [];
             resultSeen = {};
+            semanticSeen = {};
+            bestFound = null;
+            autoStarted = false;
+            clearTimeout(autoTimer);
+            autoTimer = null;
             last = null;
             resultRoot.empty();
         }
@@ -2206,7 +1879,11 @@
             if (totalResults) {
                 var text = totalResults + ' ' + (totalResults === 1 ? 'вариант' : (totalResults < 5 ? 'варианта' : 'вариантов'));
                 if (failures.length) text += ' · часть источников недоступна';
+                if (settingEnabled('capsule_trailer_autoplay', false) && bestFound && bestFound.item.score < AUTO_SCORE_MIN) {
+                    text += ' · выберите вручную: уверенность недостаточна для автостарта';
+                }
                 status.text(text);
+                scheduleAutoPlay();
             }
             else {
                 status.text(failures.length ? 'Источники сейчас недоступны' : 'Трейлеры не найдены');
@@ -2298,6 +1975,8 @@
         this.destroy = function () {
             alive = false;
             started = false;
+            clearTimeout(autoTimer);
+            autoTimer = null;
             if (resolvingCancel) {
                 try { resolvingCancel(); } catch (e) {}
                 resolvingCancel = null;
@@ -2321,6 +2000,38 @@
 
         Lampa.SettingsApi.addParam({
             component: 'capsule_trailer_settings',
+            param: { type: 'title' },
+            field: { name: 'Поведение' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_autoplay',
+                type: 'trigger',
+                default: false
+            },
+            field: {
+                name: 'Автоматически запускать лучший трейлер',
+                description: 'Если CAPSULE уверен в совпадении, лучший найденный трейлер запускается автоматически. При сомнительном совпадении список останется на экране.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: {
+                name: 'capsule_trailer_replace_native',
+                type: 'trigger',
+                default: false
+            },
+            field: {
+                name: 'Заменить стандартные трейлеры Lampa',
+                description: 'Убирает штатную кнопку трейлеров Lampa из карточки и оставляет только CAPSULE Trailer.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
             param: {
                 name: 'capsule_trailer_quality',
                 type: 'select',
@@ -2336,7 +2047,25 @@
             },
             field: {
                 name: 'Приоритет качества',
-                description: 'CAPSULE сначала выбирает ближайшее к этому качеству. Если выбрано «Лучшее доступное» — предпочитается максимальное качество.'
+                description: 'CAPSULE сначала выбирает ближайшее к этому качеству. «Лучшее доступное» предпочитает максимальное качество.'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: { type: 'title' },
+            field: { name: 'Источники' }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'capsule_trailer_settings',
+            param: { type: 'static' },
+            field: {
+                name: 'OK.ru — основной источник',
+                description: 'Всегда включён. На нём строится основной быстрый поиск CAPSULE Trailer; отключить его нельзя.'
+            },
+            onRender: function (item) {
+                item.removeClass('selector');
             }
         });
 
@@ -2349,7 +2078,7 @@
             },
             field: {
                 name: 'Прямые трейлеры Lampa',
-                description: 'Использовать только уже полученные Lampa прямые MP4/HLS/DASH ссылки. Внешние видеостраницы сюда не попадают.'
+                description: 'Использовать уже полученные Lampa прямые MP4/HLS/DASH ссылки, если они есть.'
             }
         });
 
@@ -2362,7 +2091,7 @@
             },
             field: {
                 name: 'Кинопоиск',
-                description: 'Трейлеры из Kinopoisk API Unofficial. Работает только после ввода API key ниже.'
+                description: 'Дополнительный источник через Kinopoisk API Unofficial. Работает после ввода API key.'
             }
         });
 
@@ -2385,37 +2114,11 @@
             param: {
                 name: 'capsule_trailer_yandex',
                 type: 'trigger',
-                default: true
+                default: false
             },
             field: {
-                name: 'Yandex Video',
-                description: 'Экспериментальный источник. Прямые потоки предпочитаются HLS/DASH, чтобы уменьшить ошибки manifestLoadError.'
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'capsule_trailer_settings',
-            param: {
-                name: 'capsule_trailer_ok',
-                type: 'trigger',
-                default: true
-            },
-            field: {
-                name: 'OK.ru',
-                description: 'Экспериментальный источник публичных роликов. CAPSULE предпочитает прямые MP4 потоки.'
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'capsule_trailer_settings',
-            param: {
-                name: 'capsule_trailer_rutube',
-                type: 'trigger',
-                default: true
-            },
-            field: {
-                name: 'RUTUBE',
-                description: 'Резервный источник с низким приоритетом. Может показывать рекламу во встроенном плеере.'
+                name: 'Yandex Video · экспериментально',
+                description: 'По умолчанию выключен: на текущих тестах поиск Yandex часто не возвращает подходящих трейлеров. Можно включить для экспериментов.'
             }
         });
     }
@@ -2431,6 +2134,9 @@
 
         var container = render.find('.buttons--container');
         if (!container.length) return;
+
+        var nativeTrailer = container.find('.view--trailer').last();
+        var replaceNative = settingEnabled('capsule_trailer_replace_native', false);
 
         var button = $('' +
             '<div class="full-start__button selector view--capsule-trailer" data-subtitle="CAPSULE Trailer · агрегатор">' +
@@ -2451,8 +2157,11 @@
             });
         });
 
-        var nativeTrailer = container.find('.view--trailer').last();
-        if (nativeTrailer.length) nativeTrailer.after(button);
+        if (replaceNative && nativeTrailer.length) {
+            nativeTrailer.before(button);
+            nativeTrailer.remove();
+        }
+        else if (nativeTrailer.length) nativeTrailer.after(button);
         else container.append(button);
     }
 
@@ -2460,7 +2169,6 @@
         addStyles();
         setupSettings();
         registerCapsuleMediaTube();
-        registerRutubeTube();
         registerPlaybackFallback();
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, TrailerComponent);
         Lampa.Listener.follow('full', addCardButton);
