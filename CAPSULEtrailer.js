@@ -12,8 +12,8 @@
  *
  * Discovery / playback layers:
  * - Direct trailer URLs already present in Lampa movie metadata.
- * - Kinopoisk API Unofficial metadata + Kinopoisk trailer widget stream resolver.
- * - OK.ru is the primary trailer source; Yandex Video/VH is an optional experimental provider.
+ * - Kinopoisk API Unofficial metadata + Kinopoisk trailer widget/stream metadata.
+ * - OK.ru is the primary trailer source.
  *
  */
 (function () {
@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.7.0';
+    var VERSION = '2.8.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v9';
+    var CACHE_KEY = 'capsule_trailer_cache_v10';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -35,9 +35,9 @@
     var jsonpSerial = 0;
 
     var ICON = '' +
-        '<svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
-            '<rect x="4.5" y="7.5" width="23" height="17" rx="7.5" stroke="currentColor" stroke-width="2.2"/>' +
-            '<path d="M14 12.1L20.6 16L14 19.9V12.1Z" fill="currentColor"/>' +
+        '<svg width="42" height="42" viewBox="0 0 42 42" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+            '<rect x="3.5" y="9.5" width="35" height="23" rx="11.5" stroke="currentColor" stroke-width="2.35"/>' +
+            '<path d="M17 14.8L27.5 21L17 27.2V14.8Z" fill="currentColor"/>' +
         '</svg>';
 
     function log() {
@@ -152,6 +152,44 @@
             if (input[i].length > 1 && !stop[input[i]]) out.push(input[i]);
         }
         return out;
+    }
+
+    function shortTitleConflict(resultTitle, variants) {
+        var allowed = {
+            'трейлер':1,'trailer':1,'тизер':1,'teaser':1,'официальный':1,'official':1,
+            'русский':1,'russian':1,'дублированный':1,'дублирован':1,'dubbed':1,
+            'мультфильм':1,'мульт':1,'animation':1,'animated':1,'анимационный':1,
+            'фильм':1,'film':1,'movie':1,'hd':1,'uhd':1,'fullhd':1
+        };
+        var result = meaningfulTitleWords(resultTitle);
+
+        for (var v = 0; v < variants.length; v++) {
+            var base = meaningfulTitleWords(variants[v]);
+            if (base.length !== 1) continue;
+
+            var target = base[0];
+            if (result.indexOf(target) < 0) continue;
+
+            var foreign = [];
+            for (var i = 0; i < result.length; i++) {
+                var token = result[i];
+                if (token === target || allowed[token]) continue;
+                if (/^(?:19|20)\d{2}$/.test(token)) continue;
+                if (/^(?:2160|1440|1080|720|480|360|240|144)p?$/.test(token)) continue;
+                foreign.push(token);
+            }
+
+            if (!foreign.length) return false;
+        }
+
+        for (var k = 0; k < variants.length; k++) {
+            if (meaningfulTitleWords(variants[k]).length === 1) {
+                var one = meaningfulTitleWords(variants[k])[0];
+                if (result.indexOf(one) >= 0) return true;
+            }
+        }
+
+        return false;
     }
 
     function semanticTrailerKey(item) {
@@ -334,6 +372,7 @@
             var meaningful = meaningfulTitleWords(movie && (movie.title || movie.name || movie.original_title || movie.original_name) || '');
             if (best < 80) return -9999;
             if (meaningful.length <= 2 && best < 150) return -9999;
+            if (shortTitleConflict(item.title, variants)) return -9999;
         }
         score += best;
 
@@ -1530,17 +1569,37 @@
 
                 function extractWidgetHls(html) {
                     html = String(html || '');
+
+                    function valueAfter(marker) {
+                        var at = html.indexOf(marker);
+                        if (at < 0) return '';
+
+                        var start = html.indexOf('https://', at);
+                        if (start < 0) return '';
+
+                        var end = start;
+                        while (end < html.length) {
+                            var ch = html.charAt(end);
+                            if (ch === '"' || ch === "'" || ch === '<' || /\s/.test(ch)) break;
+                            if (ch === '%' && html.substr(end, 3).toLowerCase() === '%22') break;
+                            end++;
+                        }
+
+                        return decodeRepeated(html.slice(start, end));
+                    }
+
+                    var stream = valueAfter('streamUrl');
+                    if (/^https?:\/\/[^\s]+\.m3u8/i.test(stream)) return stream;
+
                     var match = html.match(/[?&]mq_url=([^&"'<>\s]+)/i);
+                    if (match) {
+                        stream = decodeRepeated(match[1] || '');
+                        if (stream.indexOf('http') > 0) stream = stream.slice(stream.indexOf('http'));
+                        if (/^https?:\/\//i.test(stream)) return stream;
+                    }
 
-                    if (!match) match = html.match(/["']mq_url["']\s*[:=]\s*["']([^"']+)/i);
-                    if (!match) match = html.match(/(https?(?:%3A|:)\/?\/?[^"'<>\s]+?\.m3u8[^"'<>\s]*)/i);
-
-                    if (!match) return '';
-
-                    var value = decodeRepeated(match[1] || match[0]);
-
-                    if (value.indexOf('http') > 0) value = value.slice(value.indexOf('http'));
-                    return /^https?:\/\//i.test(value) ? value : '';
+                    var generic = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
+                    return generic ? decodeRepeated(generic[0]) : '';
                 }
 
                 function requestText(url, callback) {
@@ -2025,29 +2084,53 @@
             '.capsule-kinopoisk-loader__spinner{width:2.8em;height:2.8em;border:.22em solid rgba(255,255,255,.22);border-top-color:#fff;border-radius:50%;animation:capsule-kinopoisk-spin .8s linear infinite}' +
             '.capsule-kinopoisk-loader__text{font-size:1em;margin-top:1em;opacity:.72}' +
             '@keyframes capsule-kinopoisk-spin{to{transform:rotate(360deg)}}' +
-            '.capsule-trailer{padding:1.8em 2.2em 3em;box-sizing:border-box;max-width:78em;margin:0 auto;color:inherit}' +
-            '.capsule-trailer__head{display:flex;align-items:center;margin:0 0 1.5em}' +
-            '.capsule-trailer__poster{width:4.2em;height:6.2em;object-fit:cover;border-radius:.45em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1.1em}' +
-            '.capsule-trailer__poster--empty{display:flex;align-items:center;justify-content:center}' +
-            '.capsule-trailer__poster--empty svg{width:2em;height:2em;opacity:.7}' +
-            '.capsule-trailer__title{font-size:1.55em;font-weight:600;line-height:1.2}' +
-            '.capsule-trailer__sub{font-size:.95em;opacity:.58;margin-top:.35em}' +
-            '.capsule-trailer__status{font-size:.95em;opacity:.55;margin:.4em 0 1em}' +
-            '.capsule-trailer__item{display:flex;align-items:center;padding:.72em;border-radius:.55em;margin:.25em 0;transition:background-color .12s ease,transform .12s ease;box-sizing:border-box}' +
-            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.13)}' +
-            '.capsule-trailer__item.focus{transform:scale(1.012)}' +
-            '.capsule-trailer__thumb{width:10.5em;height:5.9em;object-fit:cover;border-radius:.38em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1em}' +
+
+            '.capsule-trailer{width:100%;box-sizing:border-box;color:inherit;padding-bottom:3em}' +
+            '.capsule-trailer__hero{position:relative;width:100%;height:24em;overflow:hidden;background:#18191b}' +
+            '.capsule-trailer__backdrop{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.92}' +
+            '.capsule-trailer__hero:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(18,19,21,.04) 0%,rgba(18,19,21,.18) 45%,rgba(18,19,21,.82) 78%,#18191b 100%)}' +
+            '.capsule-trailer__hero-info{position:absolute;z-index:2;left:2.2em;right:2.2em;bottom:2.05em;max-width:74em;margin:0 auto}' +
+            '.capsule-trailer__hero-icon{display:none}' +
+            '.capsule-trailer__title{font-size:2.45em;font-weight:650;line-height:1.05;letter-spacing:-.02em;text-shadow:0 .05em .25em rgba(0,0,0,.45)}' +
+            '.capsule-trailer__sub{font-size:1em;opacity:.68;margin-top:.6em}' +
+
+            '.capsule-trailer__summary{display:flex;align-items:center;justify-content:space-between;max-width:78em;margin:0 auto;padding:1.2em 2.2em .65em;box-sizing:border-box}' +
+            '.capsule-trailer__status{font-size:1em;opacity:.66;min-width:0}' +
+            '.capsule-trailer__sort{font-size:.9em;opacity:.42;margin-left:1em;white-space:nowrap}' +
+            '.capsule-trailer__results{max-width:78em;margin:0 auto;padding:0 2.2em 5em;box-sizing:border-box}' +
+
+            '.capsule-trailer__item{display:flex;align-items:center;position:relative;padding:.72em;border:1px solid transparent;border-radius:.82em;margin:.2em 0;transition:background-color .12s ease,border-color .12s ease,transform .12s ease;box-sizing:border-box}' +
+            '.capsule-trailer__item+.capsule-trailer__item:before{content:"";position:absolute;left:12.2em;right:.7em;top:-.1em;height:1px;background:rgba(255,255,255,.055)}' +
+            '.capsule-trailer__item--best{background:rgba(255,255,255,.035)}' +
+            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.18)}' +
+            '.capsule-trailer__item.focus{transform:scale(1.008)}' +
+            '.capsule-trailer__thumb{width:10.5em;height:5.9em;object-fit:cover;border-radius:.72em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1em}' +
             '.capsule-trailer__thumb--empty{display:flex;align-items:center;justify-content:center}' +
-            '.capsule-trailer__thumb--empty svg{width:2em;height:2em;opacity:.55}' +
+            '.capsule-trailer__thumb--empty svg{width:2.7em;height:2.7em;opacity:.65}' +
             '.capsule-trailer__meta{min-width:0;flex:1}' +
-            '.capsule-trailer__name{font-size:1.05em;font-weight:500;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
-            '.capsule-trailer__line{font-size:.86em;opacity:.56;margin-top:.34em}' +
-            '.capsule-trailer__empty{padding:2em 0;opacity:.65;font-size:1.05em}' +
-            '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.72em 1.05em;border-radius:.5em;background:rgba(255,255,255,.1);margin-top:.8em}' +
-            '.capsule-trailer__results{padding-bottom:4em}' +
-            'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:10em}' +
-            'body.true--mobile.orientation--landscape .capsule-trailer{padding-right:10em}' +
-            '@media(max-width:700px){.capsule-trailer{padding:1.1em 1em 2.5em}.capsule-trailer__head{margin-bottom:1em}.capsule-trailer__poster{width:3.4em;height:5em;margin-right:.8em}.capsule-trailer__title{font-size:1.25em}.capsule-trailer__item{padding:.6em .2em;border-radius:.4em}.capsule-trailer__thumb{width:7.8em;height:4.39em;margin-right:.75em}.capsule-trailer__name{font-size:.98em}}';
+            '.capsule-trailer__name{font-size:1.06em;font-weight:500;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.capsule-trailer__line{font-size:.86em;opacity:.56;margin-top:.38em;line-height:1.35}' +
+            '.capsule-trailer__empty{padding:2em .2em;opacity:.65;font-size:1.05em}' +
+            '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.72em 1.05em;border-radius:.7em;background:rgba(255,255,255,.1);margin-top:.8em}' +
+
+            '.view--capsule-trailer svg{width:1.55em;height:1.55em}' +
+            '.settings-param[data-name="capsule_trailer_settings"] svg{width:1.35em;height:1.35em}' +
+
+            'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:11em}' +
+            'body.true--mobile.orientation--landscape .capsule-trailer__results{padding-right:11em}' +
+            '@media(max-width:700px){' +
+                '.capsule-trailer__hero{height:19em}' +
+                '.capsule-trailer__hero-info{left:1.15em;right:1.15em;bottom:1.45em}' +
+                '.capsule-trailer__title{font-size:2em}' +
+                '.capsule-trailer__summary{padding:1em 1.1em .55em}' +
+                '.capsule-trailer__results{padding:0 1.05em 4em}' +
+                '.capsule-trailer__item{padding:.62em .2em;border-radius:.72em}' +
+                '.capsule-trailer__item+.capsule-trailer__item:before{left:8.65em;right:.2em}' +
+                '.capsule-trailer__thumb{width:7.8em;height:4.39em;margin-right:.75em;border-radius:.6em}' +
+                '.capsule-trailer__name{font-size:.98em}' +
+                '.capsule-trailer__line{font-size:.8em}' +
+                '.capsule-trailer__sort{display:none}' +
+            '}';
         document.head.appendChild(style);
     }
 
@@ -2059,6 +2142,17 @@
         return 'https://image.tmdb.org/t/p/w300' + movie.poster_path;
     }
 
+    function backdropUrl(movie) {
+        if (!movie) return '';
+        if (movie.backdrop_path) {
+            if (Lampa.Api && Lampa.Api.img) {
+                try { return Lampa.Api.img(movie.backdrop_path, 'w1280'); } catch (e) {}
+            }
+            return 'https://image.tmdb.org/t/p/w1280' + movie.backdrop_path;
+        }
+        return movie.background_image || '';
+    }
+
     function TrailerComponent(object) {
         var self = this;
         var movie = object.movie || {};
@@ -2068,6 +2162,7 @@
         var content = $('<div class="capsule-trailer"></div>');
         html.addClass('capsule-trailer-scroll');
         var status = $('<div class="capsule-trailer__status"></div>');
+        var summary = $('<div class="capsule-trailer__summary"></div>');
         var resultRoot = $('<div class="capsule-trailer__results"></div>');
         var alive = true;
         var started = false;
@@ -2084,17 +2179,17 @@
         var autoStarted = false;
 
         function header() {
-            var poster = imageUrl(movie);
+            var backdrop = backdropUrl(movie);
             var title = movie.title || movie.name || movie.original_title || movie.original_name || 'Трейлеры';
             var year = yearOf(movie);
-            var left;
-            if (poster) left = '<img class="capsule-trailer__poster" src="' + escapeHtml(poster) + '" />';
-            else left = '<div class="capsule-trailer__poster capsule-trailer__poster--empty">' + ICON + '</div>';
+            var image = backdrop ? '<img class="capsule-trailer__backdrop" src="' + escapeHtml(backdrop) + '" />' : '';
             return $(
-                '<div class="capsule-trailer__head">' +
-                    left +
-                    '<div><div class="capsule-trailer__title">' + escapeHtml(title) + '</div>' +
-                    '<div class="capsule-trailer__sub">' + escapeHtml(year ? year + ' · CAPSULE Trailer' : 'CAPSULE Trailer') + '</div></div>' +
+                '<div class="capsule-trailer__hero">' +
+                    image +
+                    '<div class="capsule-trailer__hero-info">' +
+                        '<div class="capsule-trailer__title">' + escapeHtml(title) + '</div>' +
+                        '<div class="capsule-trailer__sub">' + escapeHtml(year ? year + ' · CAPSULE Trailer' : 'CAPSULE Trailer') + '</div>' +
+                    '</div>' +
                 '</div>'
             );
         }
@@ -2205,6 +2300,9 @@
                 return (parseInt($(b).attr('data-score'), 10) || 0) - (parseInt($(a).attr('data-score'), 10) || 0);
             });
             for (var i = 0; i < nodes.length; i++) resultRoot.append(nodes[i]);
+
+            resultRoot.children('.capsule-trailer__item').removeClass('capsule-trailer__item--best');
+            resultRoot.children('.capsule-trailer__item').first().addClass('capsule-trailer__item--best');
 
             if (started && Lampa.Activity.own(self)) {
                 var enabled = Lampa.Controller.enabled();
@@ -2340,7 +2438,9 @@
 
         this.create = function () {
             content.append(header());
-            content.append(status);
+            summary.append(status);
+            summary.append('<div class="capsule-trailer__sort">Лучшие совпадения</div>');
+            content.append(summary);
             content.append(resultRoot);
             scroll.append(content);
             try { scroll.height(); } catch (e) {}
