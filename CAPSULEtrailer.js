@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.17.0';
+    var VERSION = '3.18.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v17';
+    var CACHE_KEY = 'capsule_trailer_cache_v18';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -546,6 +546,10 @@
         }
 
         if (configured) add(configuredProxyUrl(configured, url), 'configured');
+
+        // Browser Lampa cannot use Android's native HTTP transport. Prefer a
+        // current keyless GET bridge and keep AllOrigins as a second fallback.
+        add('https://proxy.cors.dev/' + url, 'cors.dev');
         add('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 'allorigins');
 
         return out;
@@ -600,6 +604,7 @@
                     done(null, data);
                 }, function () {
                     if (!active || current !== network) return;
+                    log('browser transport failed', candidate.kind, url);
                     current = null;
                     next();
                 }, false, {
@@ -720,6 +725,20 @@
                 if (proxyError) finish(new Error('network'));
                 else finish(null, data);
             });
+        }
+
+        // In a normal desktop browser the direct cross-origin request is known
+        // to be the wrong transport. Do not waste the whole timeout before the
+        // browser-safe path.
+        if (isBrowserHttpTransport()) {
+            failDirect();
+            return function () {
+                finished = true;
+                if (proxyCancel) {
+                    try { proxyCancel(); } catch (e) {}
+                    proxyCancel = null;
+                }
+            };
         }
 
         try {
@@ -1241,6 +1260,25 @@
         return { width: width, height: height };
     }
 
+    function dzenEmbedUrl(raw, video) {
+        raw = raw || {};
+        video = video || {};
+        var values = [
+            raw.embedUrl, raw.embed_url, raw.embed,
+            raw.playerUrl, raw.player_url,
+            video.embedUrl, video.embed_url, video.embed,
+            video.playerUrl, video.player_url
+        ];
+
+        for (var i = 0; i < values.length; i++) {
+            var value = String(values[i] || '');
+            var match = value.match(/https?:\/\/dzen\.ru\/embed\/[0-9a-z_-]+/i);
+            if (match) return match[0];
+        }
+
+        return '';
+    }
+
     function normalizeDzenSearch(data, movie) {
         var feed = data && (data.feedData || data);
         var rows = feed && feed.items;
@@ -1273,6 +1311,7 @@
                 official: /официальн|official/i.test(title),
                 dzenId: id,
                 dzenVideo: video,
+                dzenEmbed: dzenEmbedUrl(raw, video),
                 url: 'https://dzen.ru/video/watch/' + id,
                 transportScore: 66,
                 exactMovieMatch: false
@@ -1331,6 +1370,8 @@
             var durationMatch = card.match(/aria-label=["']Общая длительность видео["'][^>]*>([^<]+)/i);
             var thumbnailMatch = card.match(/background-image\s*:\s*url\(([^)]+)\)/i);
             var thumbnail = thumbnailMatch ? String(thumbnailMatch[1] || '').replace(/^["']|["']$/g, '') : '';
+            var embedMatch = card.match(/https?:\\?\/\\?\/dzen\.ru\\?\/embed\\?\/[0-9a-z_-]+/i);
+            var embedUrl = embedMatch ? String(embedMatch[0] || '').replace(/\\\//g, '/') : '';
 
             var item = {
                 id: 'dzen:' + id,
@@ -1348,6 +1389,7 @@
                 kind: trailerKind(title),
                 official: /официальн|official/i.test(title),
                 dzenId: id,
+                dzenEmbed: embedUrl,
                 url: marker + id,
                 transportScore: 62,
                 exactMovieMatch: false
@@ -2047,6 +2089,53 @@
         try { Lampa.Controller.toggle('content'); } catch (e3) {}
     }
 
+    function browserEmbedUrl(provider, item) {
+        if (!isBrowserHttpTransport() || !provider || !item) return '';
+
+        if (provider.id === 'ok' && item.okId) {
+            return 'https://ok.ru/videoembed/' + encodeURIComponent(item.okId) + '?autoplay=1';
+        }
+
+        if (provider.id === 'vk' && item.vkId) {
+            var parts = String(item.vkId).match(/^(-?\d+)_(\d+)$/);
+            if (!parts) return '';
+            return 'https://vk.com/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
+                '&id=' + encodeURIComponent(parts[2]) + '&autoplay=1';
+        }
+
+        if (provider.id === 'dzen' && item.dzenEmbed && /^https?:\/\/dzen\.ru\/embed\//i.test(item.dzenEmbed)) {
+            return item.dzenEmbed + (item.dzenEmbed.indexOf('?') >= 0 ? '&' : '?') + 'autoplay=1';
+        }
+
+        return '';
+    }
+
+    function browserPlay(provider, item, context, done) {
+        var url = browserEmbedUrl(provider, item);
+        if (!url || !Lampa.Iframe || typeof Lampa.Iframe.show !== 'function') {
+            if (done) done(false);
+            return false;
+        }
+
+        try {
+            closeSourceSelectionState();
+            Lampa.Iframe.show({
+                url: url,
+                onBack: function () {
+                    try { Lampa.Controller.toggle(NAV_CONTROLLER); } catch (e) {}
+                }
+            });
+            log('browser embed playback', provider.id, url);
+            if (done) done(true);
+            return true;
+        }
+        catch (e) {
+            log('browser embed error', provider.id, e);
+            if (done) done(false);
+            return false;
+        }
+    }
+
     function collectAutoplayCandidates(context, done) {
         var active = true;
         var finished = false;
@@ -2168,13 +2257,26 @@
                 }
 
                 var selected = results[index++];
-                if (!selected || !selected.provider || typeof selected.provider.resolve !== 'function') {
+                if (!selected || !selected.provider) {
                     next();
                     return;
                 }
 
                 if (selected.item.score < AUTO_SCORE_MIN) {
                     done(false);
+                    return;
+                }
+
+                var embed = browserEmbedUrl(selected.provider, selected.item);
+                if (embed) {
+                    if (browserPlay(selected.provider, selected.item, context, function (opened) {
+                        if (opened) done(true);
+                        else next();
+                    })) return;
+                }
+
+                if (typeof selected.provider.resolve !== 'function') {
+                    next();
                     return;
                 }
 
@@ -2936,7 +3038,12 @@
         }
 
         function play(item, provider) {
-            if (!alive || !provider || typeof provider.resolve !== 'function') return;
+            if (!alive || !provider) return;
+
+            var embed = browserEmbedUrl(provider, item);
+            if (embed && browserPlay(provider, item, context)) return;
+
+            if (typeof provider.resolve !== 'function') return;
             if (resolvingCancel) {
                 try { resolvingCancel(); } catch (e) {}
                 resolvingCancel = null;
