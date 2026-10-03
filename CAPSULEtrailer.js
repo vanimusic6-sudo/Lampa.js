@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.3.0';
+    var VERSION = '2.4.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v5';
+    var CACHE_KEY = 'capsule_trailer_cache_v6';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -764,7 +764,7 @@
                 official: /официальн|official/i.test(String(title || '')),
                 kinopoiskId: String(kpId || ''),
                 kinopoiskWidget: url,
-                transportScore: 135,
+                transportScore: 55,
                 exactMovieMatch: true
             };
             item.score = scoreCandidate(item, movie, true);
@@ -775,102 +775,33 @@
         return out.slice(0, 8);
     }
 
-    function decodePercentState(value) {
-        value = decodeHtmlEntities(String(value || '')).replace(/^\s+|\s+$/g, '');
-        if (!value) return '';
+    function normalizeKinopoiskWidgetUrl(value) {
+        var widget = decodeHtmlEntities(value || '');
+        if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(widget)) return '';
 
-        if (/%(?:7B|7b|22|5B|5b)/.test(value)) {
-            try { value = decodeURIComponent(value); } catch (e) {}
-        }
-        return value;
-    }
+        if (widget.indexOf('onlyPlayer=') < 0) widget += (widget.indexOf('?') >= 0 ? '&' : '?') + 'onlyPlayer=1';
+        if (widget.indexOf('autoplay=') < 0) widget += '&autoplay=1';
+        if (widget.indexOf('cover=') < 0) widget += '&cover=1';
 
-    function findStreamUrlDeep(value, depth) {
-        if (!value || depth > 9) return '';
-        if (typeof value === 'string') {
-            if (/^https?:\/\//i.test(value) && (value.indexOf('.m3u8') >= 0 || value.indexOf('.mp4') >= 0 || value.indexOf('.mpd') >= 0)) return value;
-            return '';
-        }
-        if (Object.prototype.toString.call(value) === '[object Array]') {
-            for (var i = 0; i < value.length; i++) {
-                var foundArray = findStreamUrlDeep(value[i], depth + 1);
-                if (foundArray) return foundArray;
-            }
-            return '';
-        }
-        if (typeof value !== 'object') return '';
-
-        if (typeof value.streamUrl === 'string' && /^https?:\/\//i.test(value.streamUrl)) return value.streamUrl;
-        if (typeof value.contentUrl === 'string' && /^https?:\/\//i.test(value.contentUrl)) return value.contentUrl;
-
-        for (var key in value) {
-            if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-            var found = findStreamUrlDeep(value[key], depth + 1);
-            if (found) return found;
-        }
-        return '';
-    }
-
-    function parseKinopoiskWidgetStream(text) {
-        text = String(text || '');
-
-        var direct = text.match(/"streamUrl"\s*:\s*"((?:\\.|[^"\\])*)"/);
-        if (direct && direct[1]) {
-            var directUrl = decodeJsonString(direct[1]);
-            if (/^https?:\/\//i.test(directUrl)) return directUrl;
-        }
-
-        var scriptMatch = text.match(/<script[^>]*\bdata-state(?:=(?:"[^"]*"|'[^']*'))?[^>]*>([\s\S]*?)<\/script>/i);
-        var candidates = [];
-        if (scriptMatch && scriptMatch[1]) candidates.push(scriptMatch[1]);
-
-        var attrMatch = text.match(/\bdata-state=(["'])([\s\S]*?)\1/i);
-        if (attrMatch && attrMatch[2]) candidates.push(attrMatch[2]);
-
-        for (var i = 0; i < candidates.length; i++) {
-            var raw = decodePercentState(candidates[i]);
-            var state = parseMaybeJson(raw);
-            if (!state) continue;
-            var found = findStreamUrlDeep(state, 0);
-            if (found) return found;
-        }
-
-        return '';
+        return widget;
     }
 
     function resolveKinopoisk(item, context, done) {
-        var widget = decodeHtmlEntities(item.kinopoiskWidget || item.url || '');
-        if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(widget)) {
+        var widget = normalizeKinopoiskWidgetUrl(item.kinopoiskWidget || item.url || '');
+        if (!widget) {
             done(new Error('kinopoisk-widget'));
             return function () {};
         }
 
-        return textRequest(widget, RESOLVE_TIMEOUT, function (error, text) {
-            if (error || !text) return done(error || new Error('kinopoisk-widget-load'));
-
-            var stream = parseKinopoiskWidgetStream(text);
-            if (!stream) return done(new Error('kinopoisk-stream'));
-
-            var streamType = /\.m3u8(?:[?#]|$)/i.test(stream) ? 'hls' :
-                (/\.mpd(?:[?#]|$)/i.test(stream) ? 'dash' : 'direct');
-            var playUrl = streamType === 'direct' ? capsuleMediaUrl(stream, 'direct') :
-                (streamType === 'hls' ? capsuleMediaUrl(stream, 'hls') : stream);
-
-            var data = {
-                url: playUrl,
-                title: item.title,
-                card: context.movie,
-                capsule_trailer: true,
-                capsule_source: 'kinopoisk-widget',
-                headers: playbackHeaders('kinopoisk'),
-                hls_manifest_timeout: 15000
-            };
-            if (streamType === 'hls') data.hls_type = 'native';
-            done(null, data);
-        }, {
-            'Accept': 'text/html,*/*',
-            'Referer': 'https://www.kinopoisk.ru/'
+        done(null, {
+            url: widget,
+            title: item.title,
+            card: context.movie,
+            capsule_trailer: true,
+            capsule_source: 'kinopoisk-widget'
         });
+
+        return function () {};
     }
 
     var KinopoiskProvider = {
@@ -912,246 +843,6 @@
             };
         },
         resolve: resolveKinopoisk
-    };
-
-    function decodeJsonString(raw) {
-        if (typeof raw !== 'string') return '';
-        try { return JSON.parse('"' + raw.replace(/"/g, '\\"') + '"'); } catch (e) {}
-        return raw.replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\u0026/g, '&');
-    }
-
-    function extractNearby(text, start, end, pattern) {
-        var part = text.slice(Math.max(0, start), Math.min(text.length, end));
-        var match = part.match(pattern);
-        return match ? match[1] : '';
-    }
-
-    function parseYandexCandidates(text, movie) {
-        text = String(text || '');
-        var out = [];
-        var seen = {};
-        var marker = '"trailerIframeUrl":"';
-        var pos = 0;
-        while ((pos = text.indexOf(marker, pos)) >= 0) {
-            var valueStart = pos + marker.length;
-            var valueEnd = text.indexOf('"', valueStart);
-            if (valueEnd < 0) break;
-            var iframe = decodeJsonString(text.slice(valueStart, valueEnd));
-            if (iframe.indexOf('//') === 0) iframe = 'https:' + iframe;
-            var before = text.slice(Math.max(0, pos - 3600), pos);
-            var after = text.slice(valueEnd, Math.min(text.length, valueEnd + 3600));
-            var nearby = before + after;
-            var titleMatches = before.match(/"title":"((?:\\.|[^"\\])*)"/g) || [];
-            var titleRaw = titleMatches.length ? titleMatches[titleMatches.length - 1].replace(/^"title":"|"$/g, '') : '';
-            if (!titleRaw) {
-                var afterTitle = after.match(/"title":"((?:\\.|[^"\\])*)"/);
-                titleRaw = afterTitle ? afterTitle[1] : '';
-            }
-            var title = decodeJsonString(titleRaw);
-            var yearMatch = nearby.match(/"releaseYear":(\d{4})/);
-            var kpMatch = nearby.match(/"kpId":"?(\d+)"?/);
-            var idMatch = iframe.match(/frontend\.vh\.yandex\.ru\/player\/([A-Za-z0-9_-]+)/i);
-            if (idMatch && title && !seen[idMatch[1]]) {
-                var item = {
-                    id: 'yandex:' + idMatch[1],
-                    canonical: 'yandex:' + idMatch[1],
-                    provider: 'yandex',
-                    providerName: 'Yandex Video',
-                    title: title + ' — трейлер',
-                    description: '',
-                    duration: 0,
-                    thumbnail: imageUrl(movie),
-                    author: '',
-                    language: '',
-                    qualityHint: '',
-                    year: yearMatch ? yearMatch[1] : '',
-                    kind: 'trailer',
-                    official: false,
-                    yandexId: idMatch[1],
-                    yandexPlayer: iframe,
-                    kpId: kpMatch ? kpMatch[1] : '',
-                    transportScore: 125,
-                    exactMovieMatch: false
-                };
-                var exact = Boolean(movie.kinopoisk_id && item.kpId && String(movie.kinopoisk_id) === String(item.kpId));
-                item.exactMovieMatch = exact;
-                item.score = scoreCandidate(item, movie, exact);
-                if (item.score >= 0) {
-                    seen[idMatch[1]] = true;
-                    out.push(item);
-                }
-            }
-            pos = valueEnd + 1;
-        }
-        out = dedupeCandidates(out);
-        return out.slice(0, 3);
-    }
-
-    function resolveYandex(item, context, done) {
-        var id = item.yandexId;
-        if (!id) {
-            done(new Error('yandex-id'));
-            return function () {};
-        }
-
-        var url = 'https://frontend.vh.yandex.ru/v23/player/' + encodeURIComponent(id) + '.json?stream_options=hires&disable_trackings=1';
-        return nativeRequest(url, RESOLVE_TIMEOUT, function (error, data) {
-            if (error || !data || !data.content) return done(error || new Error('yandex-invalid'));
-
-            var content = data.content;
-            var streams = content.streams || [];
-            var direct = [];
-            var hls = [];
-            var dash = [];
-            var other = [];
-
-            function addCandidate(raw) {
-                if (!raw) return;
-                var streamUrl = typeof raw === 'string' ? raw : raw.url;
-                if (!/^https?:\/\//i.test(String(streamUrl || ''))) return;
-                streamUrl = String(streamUrl);
-
-                var height = 0;
-                if (typeof raw === 'object') {
-                    height = parseInt(raw.height, 10) ||
-                        qualityNumber(raw.quality || raw.label || raw.name || raw.title);
-                }
-                if (!height) height = yandexTypeHeight(streamUrl);
-
-                if (/\.ismc(?:[?#]|$)/i.test(streamUrl)) return;
-                if (/\.m3u8(?:[?#]|$)/i.test(streamUrl) || /[?&]ct=8(?:&|$)/.test(streamUrl)) {
-                    hls.push({ url: streamUrl, height: height });
-                    return;
-                }
-                if (/\.mpd(?:[?#]|$)/i.test(streamUrl) || /[?&]ct=6(?:&|$)/.test(streamUrl)) {
-                    dash.push({ url: streamUrl, height: height });
-                    return;
-                }
-                if (/\.mp4(?:[?#]|$)/i.test(streamUrl) || /[?&]ct=0(?:&|$)/.test(streamUrl)) {
-                    direct.push({ url: streamUrl, height: height });
-                    return;
-                }
-                other.push({ url: streamUrl, height: height });
-            }
-
-            for (var i = 0; i < streams.length; i++) addCandidate(streams[i]);
-            if (content.content_url) addCandidate({ url: content.content_url });
-
-            var selected = pickPreferredStream(direct);
-            var selectedType = 'direct';
-            if (!selected) {
-                selected = pickPreferredStream(hls);
-                selectedType = 'hls';
-            }
-            if (!selected) {
-                selected = pickPreferredStream(dash);
-                selectedType = 'dash';
-            }
-            if (!selected) {
-                selected = pickPreferredStream(other);
-                selectedType = 'other';
-            }
-            if (!selected || !selected.url) return done(new Error('yandex-no-stream'));
-
-            var selectedUrl = selectedType === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
-                (selectedType === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
-            var result = {
-                url: selectedUrl,
-                title: item.title,
-                card: context.movie,
-                capsule_trailer: true,
-                capsule_source: selectedType === 'direct' ? 'yandex-direct' : 'yandex-vh',
-                headers: playbackHeaders('yandex'),
-                hls_manifest_timeout: 15000
-            };
-
-            if (selectedType === 'hls') result.hls_type = 'native';
-
-            var alternates = [];
-            function addYandexAlternates(list, type) {
-                for (var ai = 0; ai < list.length; ai++) {
-                    var candidate = list[ai];
-                    if (!candidate || !candidate.url || candidate.url === selected.url) continue;
-                    alternates.push({
-                        url: type === 'direct' ? capsuleMediaUrl(candidate.url, 'direct') :
-                            (type === 'hls' ? capsuleMediaUrl(candidate.url, 'hls') : candidate.url),
-                        hls_type: type === 'hls' ? 'native' : '',
-                        headers: playbackHeaders('yandex')
-                    });
-                }
-            }
-            addYandexAlternates(direct, 'direct');
-            addYandexAlternates(hls, 'hls');
-            addYandexAlternates(dash, 'dash');
-            addYandexAlternates(other, 'other');
-            attachAlternateStreams(result, alternates);
-
-            done(null, result);
-        });
-    }
-
-    var YandexProvider = {
-        id: 'yandex',
-        name: 'Yandex Video',
-        tier: 'experimental',
-        search: function (context, done) {
-            if (!settingEnabled('capsule_trailer_yandex', false)) {
-                done(null, []);
-                return function () {};
-            }
-            var movie = context.movie || {};
-            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
-            var original = movie.original_title || movie.original_name || '';
-            var year = yearOf(movie);
-            var queries = [];
-            var all = [];
-            var seen = {};
-            var index = 0;
-            var cancelled = false;
-            var cancelCurrent = null;
-            var key = 'yandex:' + movieKey(movie);
-            var cached = cacheGet(key);
-            if (cached) {
-                done(null, cached);
-                return function () {};
-            }
-            queries.push([title, year, mediaType(movie) === 'tv' ? 'сериал' : 'фильм'].join(' '));
-            if (original && cleanText(original) !== cleanText(title)) queries.push([original, year, mediaType(movie) === 'tv' ? 'series' : 'movie'].join(' '));
-
-            function finish() {
-                if (cancelled) return;
-                all.sort(function (a, b) { return b.score - a.score; });
-                all = all.slice(0, 3);
-                cachePut(key, all);
-                done(null, all);
-            }
-
-            function next() {
-                if (cancelled) return;
-                if (index >= queries.length) return finish();
-                var q = queries[index++];
-                var url = 'https://yandex.ru/video/search?text=' + encodeURIComponent(q);
-                cancelCurrent = textRequest(url, 6500, function (error, body) {
-                    if (!error && body) {
-                        var parsed = parseYandexCandidates(body, movie);
-                        for (var i = 0; i < parsed.length; i++) {
-                            if (!seen[parsed[i].id]) {
-                                seen[parsed[i].id] = true;
-                                all.push(parsed[i]);
-                            }
-                        }
-                    }
-                    next();
-                });
-            }
-
-            next();
-            return function () {
-                cancelled = true;
-                if (cancelCurrent) cancelCurrent();
-            };
-        },
-        resolve: resolveYandex
     };
 
     function decodeHtmlEntities(value) {
@@ -1220,7 +911,7 @@
                 id: 'ok:' + id,
                 canonical: 'ok:' + id,
                 provider: 'ok',
-                providerName: 'OK',
+                providerName: 'OK.ru',
                 title: title,
                 description: decodeHtmlEntities(card.description || ''),
                 duration: durationMs > 1000 ? Math.round(durationMs / 1000) : durationMs,
@@ -1441,6 +1132,8 @@
                             }
                         }
                     }
+
+                    if (index === 1 && all.length >= 2) return finish();
                     next();
                 });
             }
@@ -1454,7 +1147,7 @@
         resolve: resolveOk
     };
 
-    var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, OkProvider, YandexProvider];
+    var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, OkProvider];
 
     function registerCapsuleMediaTube() {
         if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
@@ -1488,6 +1181,231 @@
 
         if (Lampa.PlayerVideo.registerTube(registration)) {
             window.capsule_trailer_media_tube = registration;
+        }
+    }
+
+    function registerKinopoiskTube() {
+        if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
+        if (window.capsule_trailer_kinopoisk_tube) return;
+
+        var registration = {
+            name: 'CAPSULE KINOPOISK',
+            verify: function (src) {
+                return /^https?:\/\/widgets\.kinopoisk\.ru\//i.test(String(src || ''));
+            },
+            create: function (callVideo) {
+                var object = $('<div class="capsule-kinopoisk-player"></div>');
+                var video = object[0];
+                var listener = Lampa.Subscribe();
+                var frame = null;
+                var streamUrl = '';
+                var current = 0;
+                var duration = 0;
+                var paused = true;
+                var volume = 1;
+                var muted = false;
+                var ready = false;
+                var wantedPlay = false;
+                var ended = false;
+                var initTimer = null;
+
+                function post(method, data) {
+                    if (!frame || !frame.contentWindow) return;
+                    var message = data || {};
+                    message.method = method;
+                    try { frame.contentWindow.postMessage(message, '*'); } catch (e) {}
+                }
+
+                function parseMessage(event) {
+                    if (!frame || event.source !== frame.contentWindow) return null;
+                    if (event.origin && event.origin.indexOf('kinopoisk.ru') < 0 && event.origin.indexOf('yandex.ru') < 0) return null;
+                    var message = event.data;
+                    if (typeof message === 'string') {
+                        try { message = JSON.parse(message); } catch (e) { return null; }
+                    }
+                    return message && typeof message === 'object' ? message : null;
+                }
+
+                function sendEnded() {
+                    if (ended) return;
+                    ended = true;
+                    paused = true;
+                    listener.send('ended');
+                }
+
+                function onMessage(event) {
+                    var message = parseMessage(event);
+                    if (!message) return;
+
+                    var type = String(message.event || message.type || '').toLowerCase();
+
+                    if (type === 'inited' || type === 'ready' || type === 'player:ready') {
+                        var firstReady = !ready;
+                        ready = true;
+                        clearTimeout(initTimer);
+                        if (firstReady) {
+                            listener.send('canplay');
+                            listener.send('loadeddata');
+                        }
+                        post('setVolume', { volume: muted ? 0 : volume });
+                        if (wantedPlay) post('play');
+                        return;
+                    }
+
+                    if (type === 'started' || type === 'playing') {
+                        ready = true;
+                        clearTimeout(initTimer);
+                        ended = false;
+                        paused = false;
+                        if (typeof message.time !== 'undefined') current = Number(message.time) || 0;
+                        if (typeof message.duration !== 'undefined') duration = Number(message.duration) || duration;
+                        listener.send('playing');
+                        listener.send('timeupdate');
+                        return;
+                    }
+
+                    if (type === 'paused' || type === 'pause') {
+                        paused = true;
+                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
+                        listener.send('pause');
+                        listener.send('timeupdate');
+                        return;
+                    }
+
+                    if (type === 'ended' || type === 'finished') {
+                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
+                        sendEnded();
+                        return;
+                    }
+
+                    if (type === 'timeupdate' || type === 'progress') {
+                        if (typeof message.time !== 'undefined') current = Number(message.time) || current;
+                        if (typeof message.duration !== 'undefined') duration = Number(message.duration) || duration;
+                        listener.send('timeupdate');
+                        return;
+                    }
+
+                    if (type === 'error' || type === 'fatal') {
+                        paused = true;
+                        video.error = {
+                            code: message.code || 'kinopoisk',
+                            message: message.message || 'Kinopoisk widget playback error'
+                        };
+                        listener.send('error', { error: video.error, fatal: true });
+                    }
+                }
+
+                function createFrame() {
+                    if (frame) return;
+
+                    frame = document.createElement('iframe');
+                    frame.src = streamUrl;
+                    frame.setAttribute('frameborder', '0');
+                    frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
+                    frame.setAttribute('allowfullscreen', 'true');
+                    frame.style.width = '100%';
+                    frame.style.height = '100%';
+                    frame.style.border = '0';
+                    frame.style.display = 'block';
+                    frame.style.pointerEvents = 'none';
+                    object.empty().append(frame);
+
+                    initTimer = setTimeout(function () {
+                        if (ready || !frame) return;
+                        video.error = {
+                            code: 'kinopoisk-widget-timeout',
+                            message: 'Kinopoisk widget did not initialize'
+                        };
+                        listener.send('error', { error: video.error, fatal: true });
+                    }, 12000);
+                }
+
+                Object.defineProperty(video, 'src', {
+                    configurable: true,
+                    set: function (value) { streamUrl = String(value || ''); },
+                    get: function () { return streamUrl; }
+                });
+                Object.defineProperty(video, 'currentTime', {
+                    configurable: true,
+                    set: function (value) {
+                        current = Math.max(0, Number(value) || 0);
+                        post('seek', { time: current });
+                    },
+                    get: function () { return current; }
+                });
+                Object.defineProperty(video, 'duration', {
+                    configurable: true,
+                    get: function () { return duration; }
+                });
+                Object.defineProperty(video, 'paused', {
+                    configurable: true,
+                    get: function () { return paused; }
+                });
+                Object.defineProperty(video, 'volume', {
+                    configurable: true,
+                    set: function (value) {
+                        volume = Math.max(0, Math.min(1, Number(value) || 0));
+                        if (ready) post('setVolume', { volume: muted ? 0 : volume });
+                    },
+                    get: function () { return volume; }
+                });
+                Object.defineProperty(video, 'muted', {
+                    configurable: true,
+                    set: function (value) {
+                        muted = !!value;
+                        if (ready) post('setVolume', { volume: muted ? 0 : volume });
+                    },
+                    get: function () { return muted; }
+                });
+                Object.defineProperty(video, 'videoWidth', {
+                    configurable: true,
+                    get: function () { return 1920; }
+                });
+                Object.defineProperty(video, 'videoHeight', {
+                    configurable: true,
+                    get: function () { return 1080; }
+                });
+                Object.defineProperty(video, 'audioTracks', { configurable: true, get: function () { return []; } });
+                Object.defineProperty(video, 'textTracks', { configurable: true, get: function () { return []; } });
+
+                video.canPlayType = function () { return true; };
+                video.addEventListener = listener.follow.bind(listener);
+                video.load = function () {
+                    if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(streamUrl)) {
+                        video.error = { code: 'kinopoisk-url', message: 'Invalid Kinopoisk widget URL' };
+                        listener.send('error', { error: video.error, fatal: true });
+                        return;
+                    }
+                    createFrame();
+                };
+                video.play = function () {
+                    wantedPlay = true;
+                    if (ready) post('play');
+                };
+                video.pause = function () {
+                    wantedPlay = false;
+                    paused = true;
+                    if (ready) post('pause');
+                };
+                video.resize = function () {};
+                video.size = function () {};
+                video.destroy = function () {
+                    clearTimeout(initTimer);
+                    window.removeEventListener('message', onMessage);
+                    try { if (frame && frame.parentNode) frame.parentNode.removeChild(frame); } catch (e) {}
+                    frame = null;
+                    listener.destroy();
+                    object.remove();
+                };
+
+                window.addEventListener('message', onMessage);
+                callVideo(video);
+                return object;
+            }
+        };
+
+        if (Lampa.PlayerVideo.registerTube(registration)) {
+            window.capsule_trailer_kinopoisk_tube = registration;
         }
     }
 
@@ -1608,6 +1526,7 @@
         style.id = 'capsule-trailer-style';
         style.textContent = '' +
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box}' +
+            '.capsule-kinopoisk-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
             '.capsule-trailer{padding:1.8em 2.2em 3em;box-sizing:border-box;max-width:78em;margin:0 auto;color:inherit}' +
             '.capsule-trailer__head{display:flex;align-items:center;margin:0 0 1.5em}' +
             '.capsule-trailer__poster{width:4.2em;height:6.2em;object-fit:cover;border-radius:.45em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1.1em}' +
@@ -1700,7 +1619,7 @@
             return lang ? lang.toUpperCase() : '';
         }
 
-        function itemMeta(item) {
+            function itemMeta(item, provider) {
             var parts = [];
             var kind = item.kind || trailerKind(item.title);
             if (kind === 'teaser') parts.push('Тизер');
@@ -1709,11 +1628,15 @@
             if (lang) parts.push(lang);
             if (item.qualityHint) parts.push(item.qualityHint);
             if (item.duration) parts.push(secondsText(item.duration));
+
+            var source = item.providerName || (provider && provider.name) || '';
+            if (source) parts.push('Источник: ' + source);
+
             return parts;
         }
 
         function makeItem(item, provider) {
-            var meta = itemMeta(item);
+            var meta = itemMeta(item, provider);
             var thumb = item.thumbnail ?
                 '<img class="capsule-trailer__thumb" src="' + escapeHtml(item.thumbnail) + '" />' :
                 '<div class="capsule-trailer__thumb capsule-trailer__thumb--empty">' + ICON + '</div>';
@@ -2090,8 +2013,8 @@
                 default: true
             },
             field: {
-                name: 'Кинопоиск',
-                description: 'Дополнительный источник через Kinopoisk API Unofficial. Работает после ввода API key.'
+                name: 'Кинопоиск · экспериментально',
+                description: 'Поиск идёт через Kinopoisk API Unofficial, а воспроизведение — через сам Kinopoisk widget внутри плеера Lampa. Виджет может зависеть от региона.'
             }
         });
 
@@ -2109,18 +2032,6 @@
             }
         });
 
-        Lampa.SettingsApi.addParam({
-            component: 'capsule_trailer_settings',
-            param: {
-                name: 'capsule_trailer_yandex',
-                type: 'trigger',
-                default: false
-            },
-            field: {
-                name: 'Yandex Video · экспериментально',
-                description: 'По умолчанию выключен: на текущих тестах поиск Yandex часто не возвращает подходящих трейлеров. Можно включить для экспериментов.'
-            }
-        });
     }
 
     function addCardButton(event) {
@@ -2169,6 +2080,7 @@
         addStyles();
         setupSettings();
         registerCapsuleMediaTube();
+        registerKinopoiskTube();
         registerPlaybackFallback();
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, TrailerComponent);
         Lampa.Listener.follow('full', addCardButton);
