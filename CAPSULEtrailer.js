@@ -20,10 +20,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.16.0';
+    var VERSION = '3.17.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v16';
+    var CACHE_KEY = 'capsule_trailer_cache_v17';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -490,8 +490,193 @@
         return function () { finish(new Error('cancelled')); };
     }
 
+    function isAndroidNativeTransport() {
+        try {
+            return !!(Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android'));
+        }
+        catch (e) {
+            return false;
+        }
+    }
+
+    function isBrowserHttpTransport() {
+        if (isAndroidNativeTransport()) return false;
+        try {
+            return !!(window.location && /^(?:http|https):$/i.test(window.location.protocol || ''));
+        }
+        catch (e) {
+            return false;
+        }
+    }
+
+    function configuredBrowserProxy() {
+        var proxy = '';
+        try { proxy = String(Lampa.Storage.get('online_proxy_all') || ''); } catch (e) {}
+        proxy = proxy.replace(/^\s+|\s+$/g, '');
+        return proxy;
+    }
+
+    function configuredProxyUrl(proxy, target) {
+        proxy = String(proxy || '');
+        target = String(target || '');
+        if (!proxy || !target) return '';
+
+        if (proxy.indexOf('{url}') >= 0) {
+            return proxy.replace('{url}', encodeURIComponent(target));
+        }
+
+        if (/[?&](?:url|target)=$/i.test(proxy)) {
+            return proxy + encodeURIComponent(target);
+        }
+
+        if (proxy.charAt(proxy.length - 1) !== '/') proxy += '/';
+        return proxy + target;
+    }
+
+    function browserProxyCandidates(url) {
+        var out = [];
+        var seen = {};
+        var configured = configuredBrowserProxy();
+
+        function add(candidate, kind) {
+            candidate = String(candidate || '');
+            if (!candidate || seen[candidate]) return;
+            seen[candidate] = true;
+            out.push({ url: candidate, kind: kind });
+        }
+
+        if (configured) add(configuredProxyUrl(configured, url), 'configured');
+        add('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), 'allorigins');
+
+        return out;
+    }
+
+    function browserProxyGet(url, dataType, timeout, done) {
+        if (!isBrowserHttpTransport()) {
+            done(new Error('browser-proxy-unavailable'));
+            return function () {};
+        }
+
+        var candidates = browserProxyCandidates(url);
+        var index = 0;
+        var active = true;
+        var current = null;
+
+        function stopCurrent() {
+            if (!current) return;
+            try { current.clear(); } catch (e) {}
+            current = null;
+        }
+
+        function next() {
+            if (!active) return;
+            stopCurrent();
+
+            if (index >= candidates.length) {
+                done(new Error('browser-proxy-network'));
+                return;
+            }
+
+            var candidate = candidates[index++];
+            var network = new Lampa.Reguest();
+            current = network;
+            network.timeout(timeout || SEARCH_TIMEOUT);
+
+            try {
+                network.silent(candidate.url, function (data) {
+                    if (!active || current !== network) return;
+                    current = null;
+
+                    if (dataType === 'json') {
+                        var parsed = parseMaybeJson(data);
+                        if (!parsed) {
+                            next();
+                            return;
+                        }
+                        data = parsed;
+                    }
+
+                    log('browser transport fallback', candidate.kind);
+                    done(null, data);
+                }, function () {
+                    if (!active || current !== network) return;
+                    current = null;
+                    next();
+                }, false, {
+                    timeout: timeout || SEARCH_TIMEOUT,
+                    dataType: 'text'
+                });
+            }
+            catch (e) {
+                current = null;
+                next();
+            }
+        }
+
+        next();
+
+        return function () {
+            active = false;
+            stopCurrent();
+        };
+    }
+
+    function browserProxyPost(url, dataType, timeout, postData, done) {
+        if (!isBrowserHttpTransport()) {
+            done(new Error('browser-proxy-unavailable'));
+            return function () {};
+        }
+
+        var proxy = configuredBrowserProxy();
+        if (!proxy) {
+            done(new Error('browser-post-proxy-unavailable'));
+            return function () {};
+        }
+
+        var target = configuredProxyUrl(proxy, url);
+        var network = new Lampa.Reguest();
+        var active = true;
+        network.timeout(timeout || SEARCH_TIMEOUT);
+
+        try {
+            network.silent(target, function (data) {
+                if (!active) return;
+
+                if (dataType === 'json') {
+                    data = parseMaybeJson(data);
+                    if (!data) {
+                        done(new Error('browser-post-proxy-json'));
+                        return;
+                    }
+                }
+
+                log('browser POST transport fallback', 'configured');
+                done(null, data);
+            }, function () {
+                if (!active) return;
+                done(new Error('browser-post-proxy-network'));
+            }, postData || '', {
+                timeout: timeout || SEARCH_TIMEOUT,
+                dataType: 'text',
+                headers: {
+                    'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                }
+            });
+        }
+        catch (e) {
+            done(e);
+        }
+
+        return function () {
+            active = false;
+            try { network.clear(); } catch (e) {}
+        };
+    }
+
     function requestData(url, dataType, timeout, done, extraHeaders) {
         var network = new Lampa.Reguest();
+        var proxyCancel = null;
         var finished = false;
         var headers = { 'Accept': dataType === 'text' ? 'text/html,*/*' : 'application/json' };
         network.timeout(timeout || SEARCH_TIMEOUT);
@@ -502,32 +687,62 @@
             }
         }
 
+        if (isBrowserHttpTransport()) {
+            delete headers['User-Agent'];
+            delete headers['user-agent'];
+            delete headers.Referer;
+            delete headers.referer;
+            delete headers.Origin;
+            delete headers.origin;
+            delete headers.Host;
+            delete headers.host;
+        }
+
         function finish(error, data) {
             if (finished) return;
             finished = true;
             try { network.clear(); } catch (e) {}
+            if (proxyCancel) {
+                try { proxyCancel(); } catch (e2) {}
+                proxyCancel = null;
+            }
             if (!error && dataType === 'json') data = parseMaybeJson(data);
             done(error, data);
+        }
+
+        function failDirect() {
+            if (!isBrowserHttpTransport()) {
+                finish(new Error('network'));
+                return;
+            }
+
+            proxyCancel = browserProxyGet(url, dataType, timeout, function (proxyError, data) {
+                if (proxyError) finish(new Error('network'));
+                else finish(null, data);
+            });
         }
 
         try {
             network.native(url, function (data) {
                 finish(null, data);
-            }, function () {
-                finish(new Error('network'));
-            }, false, {
+            }, failDirect, false, {
                 timeout: timeout || SEARCH_TIMEOUT,
                 dataType: dataType,
                 headers: headers
             });
         }
         catch (e) {
-            finish(e);
+            if (isBrowserHttpTransport()) failDirect();
+            else finish(e);
         }
 
         return function () {
             finished = true;
             try { network.clear(); } catch (e) {}
+            if (proxyCancel) {
+                try { proxyCancel(); } catch (e2) {}
+                proxyCancel = null;
+            }
         };
     }
 
@@ -541,6 +756,7 @@
 
     function postRequest(url, dataType, timeout, postData, done) {
         var network = new Lampa.Reguest();
+        var proxyCancel = null;
         var finished = false;
         network.timeout(timeout || SEARCH_TIMEOUT);
 
@@ -548,16 +764,30 @@
             if (finished) return;
             finished = true;
             try { network.clear(); } catch (e) {}
+            if (proxyCancel) {
+                try { proxyCancel(); } catch (e2) {}
+                proxyCancel = null;
+            }
             if (!error && dataType === 'json') data = parseMaybeJson(data);
             done(error, data);
+        }
+
+        function failDirect() {
+            if (!isBrowserHttpTransport()) {
+                finish(new Error('network'));
+                return;
+            }
+
+            proxyCancel = browserProxyPost(url, dataType, timeout, postData, function (proxyError, data) {
+                if (proxyError) finish(new Error('network'));
+                else finish(null, data);
+            });
         }
 
         try {
             network.native(url, function (data) {
                 finish(null, data);
-            }, function () {
-                finish(new Error('network'));
-            }, postData || '', {
+            }, failDirect, postData || '', {
                 timeout: timeout || SEARCH_TIMEOUT,
                 dataType: dataType,
                 headers: {
@@ -567,12 +797,17 @@
             });
         }
         catch (e) {
-            finish(e);
+            if (isBrowserHttpTransport()) failDirect();
+            else finish(e);
         }
 
         return function () {
             finished = true;
             try { network.clear(); } catch (e) {}
+            if (proxyCancel) {
+                try { proxyCancel(); } catch (e2) {}
+                proxyCancel = null;
+            }
         };
     }
 
@@ -589,6 +824,8 @@
     }
 
     function playbackHeaders(source) {
+        if (isBrowserHttpTransport()) return null;
+
         var headers = { 'User-Agent': 'Mozilla/5.0' };
         if (source === 'ok') headers.Referer = 'https://ok.ru/';
         else if (source === 'vk') headers.Referer = 'https://vkvideo.ru/';
@@ -774,8 +1011,36 @@
         if (metadataUrl.indexOf('//') === 0) metadataUrl = 'https:' + metadataUrl;
         else if (metadataUrl.charAt(0) === '/') metadataUrl = 'https://ok.ru' + metadataUrl;
         if (!/^https?:\/\//i.test(metadataUrl)) return done(new Error('ok-metadata-url'));
+
         var body = flashvars.location ? 'st.location=' + encodeURIComponent(flashvars.location) : 'st.location=';
-        return postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, done);
+        var active = true;
+        var cancelCurrent = null;
+
+        cancelCurrent = postRequest(metadataUrl, 'json', RESOLVE_TIMEOUT, body, function (error, data) {
+            if (!active) return;
+            if (!error && data) {
+                done(null, data);
+                return;
+            }
+
+            if (!isBrowserHttpTransport()) {
+                done(error || new Error('ok-metadata'));
+                return;
+            }
+
+            var getUrl = metadataUrl + (metadataUrl.indexOf('?') >= 0 ? '&' : '?') + body;
+            cancelCurrent = nativeRequest(getUrl, RESOLVE_TIMEOUT, function (getError, getData) {
+                if (!active) return;
+                done(getError, getData);
+            });
+        });
+
+        return function () {
+            active = false;
+            if (cancelCurrent) {
+                try { cancelCurrent(); } catch (e3) {}
+            }
+        };
     }
 
     function resolveOk(item, context, done) {
@@ -1403,6 +1668,189 @@
         return out.slice(0, 5);
     }
 
+    function decodeJsonFragment(value) {
+        try { return JSON.parse('"' + String(value || '') + '"'); }
+        catch (e) { return String(value || '').replace(/\\\//g, '/'); }
+    }
+
+    function stripHtmlText(value) {
+        return decodeHtmlEntities(String(value || '')
+            .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/^\s+|\s+$/g, ''));
+    }
+
+    function nearestVkStringField(text, at, names, radius) {
+        var start = Math.max(0, at - (radius || 3000));
+        var end = Math.min(text.length, at + (radius || 3000));
+        var chunk = text.slice(start, end);
+        var best = '';
+        var distance = 999999;
+
+        for (var n = 0; n < names.length; n++) {
+            var escaped = String(names[n]).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
+            var re = new RegExp('"' + escaped + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', 'gi');
+            var match;
+
+            while ((match = re.exec(chunk))) {
+                var absolute = start + match.index;
+                var currentDistance = Math.abs(absolute - at);
+                if (currentDistance < distance) {
+                    distance = currentDistance;
+                    best = decodeJsonFragment(match[1]);
+                }
+            }
+        }
+
+        return decodeHtmlEntities(best);
+    }
+
+    function nearestVkNumberField(text, at, name, radius) {
+        var start = Math.max(0, at - (radius || 2400));
+        var end = Math.min(text.length, at + (radius || 2400));
+        var chunk = text.slice(start, end);
+        var escaped = String(name).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
+        var re = new RegExp('"' + escaped + '"\\s*:\\s*(\\d+)', 'gi');
+        var best = 0;
+        var distance = 999999;
+        var match;
+
+        while ((match = re.exec(chunk))) {
+            var absolute = start + match.index;
+            var currentDistance = Math.abs(absolute - at);
+            if (currentDistance < distance) {
+                distance = currentDistance;
+                best = parseInt(match[1], 10) || 0;
+            }
+        }
+
+        return best;
+    }
+
+    function normalizeVkPublicSearch(text, movie) {
+        text = decodeHtmlEntities(String(text || ''))
+            .replace(/\\u002f/gi, '/')
+            .replace(/\\\//g, '/');
+
+        var out = [];
+        var seen = {};
+        var re = /video(-?\d+)_(\d+)/gi;
+        var match;
+
+        while ((match = re.exec(text)) && out.length < 12) {
+            var videoId = match[1] + '_' + match[2];
+            if (seen[videoId]) continue;
+            seen[videoId] = true;
+
+            var at = match.index;
+            var title = nearestVkStringField(text, at, ['title', 'name'], 2600);
+
+            if (!title) {
+                var start = Math.max(0, at - 1800);
+                var end = Math.min(text.length, at + 1800);
+                var chunk = text.slice(start, end);
+                var anchor = chunk.match(/<a\b[^>]*(?:title|aria-label)=["']([^"']+)["'][^>]*>/i);
+                if (anchor) title = stripHtmlText(anchor[1]);
+            }
+
+            title = stripHtmlText(title);
+            if (!title || title.length > 320) continue;
+
+            var thumbnail = nearestVkStringField(text, at, [
+                'photo_1280', 'photo_800', 'photo_640', 'first_frame_1280',
+                'first_frame_800', 'first_frame_640', 'image'
+            ], 3200);
+            var duration = nearestVkNumberField(text, at, 'duration', 2600);
+
+            var item = {
+                id: 'vk:' + videoId,
+                canonical: 'vk:' + videoId,
+                provider: 'vk',
+                providerName: 'VK Video',
+                title: title,
+                description: '',
+                duration: duration,
+                thumbnail: thumbnail,
+                author: '',
+                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
+                qualityHint: '',
+                year: '',
+                kind: trailerKind(title),
+                official: /официальн|official/i.test(title),
+                vkId: videoId,
+                url: 'https://vk.com/video' + videoId,
+                transportScore: 62,
+                exactMovieMatch: false
+            };
+
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) out.push(item);
+        }
+
+        out = dedupeCandidates(out);
+        return out.slice(0, 5);
+    }
+
+    function vkFilesFromHtml(text) {
+        text = decodeHtmlEntities(String(text || ''))
+            .replace(/\\u002f/gi, '/');
+
+        var marker = '"files"';
+        var cursor = 0;
+
+        while (cursor < text.length) {
+            var at = text.indexOf(marker, cursor);
+            if (at < 0) break;
+            var start = text.indexOf('{', at + marker.length);
+            if (start < 0 || start - at > 120) {
+                cursor = at + marker.length;
+                continue;
+            }
+
+            var json = jsonObjectAt(text, start);
+            if (json) {
+                try {
+                    var files = JSON.parse(json);
+                    if (files && typeof files === 'object') return files;
+                }
+                catch (e) {}
+            }
+
+            cursor = start + 1;
+        }
+
+        var fallback = {};
+        var re = /"(mp4_\d+|url\d+|cache\d+|hls(?:_[^"]*)?|dash(?:_[^"]*)?)"\s*:\s*"((?:\\.|[^"\\])*)"/gi;
+        var match;
+        while ((match = re.exec(text))) {
+            var value = decodeJsonFragment(match[2]);
+            if (/^\/\//.test(value)) value = 'https:' + value;
+            if (/^https?:\/\//i.test(value)) fallback[match[1]] = value;
+        }
+
+        return Object.keys(fallback).length ? fallback : null;
+    }
+
+    function resolveVkPublic(item, context, done) {
+        var parts = String(item.vkId || '').match(/^(-?\d+)_(\d+)$/);
+        if (!parts) {
+            done(new Error('vk-public-id'));
+            return function () {};
+        }
+
+        var url = 'https://vk.com/video_ext.php?oid=' + encodeURIComponent(parts[1]) +
+            '&id=' + encodeURIComponent(parts[2]) + '&autoplay=0';
+
+        return textRequest(url, 6500, function (error, text) {
+            if (error || !text) return done(error || new Error('vk-public-page'));
+            var files = vkFilesFromHtml(text);
+            if (!files) return done(new Error('vk-public-files'));
+            finishVkResolve(files, item, context, done);
+        });
+    }
+
     function vkStreamGroups(files) {
         files = files || {};
         var direct = [];
@@ -1415,7 +1863,7 @@
             if (/^\/\//.test(url)) url = 'https:' + url;
             if (!/^https?:\/\//i.test(url)) continue;
 
-            var directMatch = String(key).match(/^mp4_(\d+)$/);
+            var directMatch = String(key).match(/^(?:mp4_|url|cache)(\d+)$/);
             if (directMatch) {
                 direct.push({ url: url, height: parseInt(directMatch[1], 10) || 0 });
                 continue;
@@ -1428,7 +1876,68 @@
         return { direct: direct, hls: hls, dash: dash };
     }
 
+    function finishVkResolve(files, item, context, done) {
+        var groups = vkStreamGroups(files);
+
+        if (!groups.direct.length && !groups.hls.length && !groups.dash.length) {
+            done(new Error('vk-stream'));
+            return;
+        }
+
+        var type = '';
+        var selected = pickPreferredStream(groups.direct);
+        if (selected) type = 'direct';
+        else {
+            selected = pickPreferredStream(groups.hls);
+            if (selected) type = 'hls';
+            else {
+                selected = pickPreferredStream(groups.dash);
+                if (selected) type = 'dash';
+            }
+        }
+
+        if (!selected || !selected.url) {
+            done(new Error('vk-stream'));
+            return;
+        }
+
+        var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+            (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
+        var result = {
+            url: playUrl,
+            title: item.title,
+            card: context.movie,
+            capsule_trailer: true,
+            capsule_source: type === 'direct' ? 'vk-direct' : 'vk-' + type,
+            headers: playbackHeaders('vk'),
+            hls_manifest_timeout: 12000
+        };
+        if (type === 'hls') result.hls_type = 'native';
+
+        var alternatives = [];
+        function addAlternatives(list, alternativeType) {
+            for (var ai = 0; ai < list.length; ai++) {
+                var stream = list[ai] || {};
+                if (!stream.url || stream.url === selected.url) continue;
+                alternatives.push({
+                    url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
+                        (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
+                    hls_type: alternativeType === 'hls' ? 'native' : '',
+                    headers: playbackHeaders('vk')
+                });
+            }
+        }
+        addAlternatives(groups.direct, 'direct');
+        addAlternatives(groups.hls, 'hls');
+        addAlternatives(groups.dash, 'dash');
+        attachAlternateStreams(result, alternatives);
+
+        done(null, result);
+    }
+
     function resolveVk(item, context, done) {
+        if (isBrowserHttpTransport()) return resolveVkPublic(item, context, done);
+
         var cancelled = false;
         var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
             if (cancelled) return;
@@ -1450,59 +1959,13 @@
 
                 var rows = data && data.response && data.response.items;
                 var video = Object.prototype.toString.call(rows) === '[object Array]' ? rows[0] : null;
-                var groups = vkStreamGroups(video && video.files);
 
-                if (error || !video || (!groups.direct.length && !groups.hls.length && !groups.dash.length)) {
+                if (error || !video || !video.files) {
                     done(error || new Error('vk-stream'));
                     return;
                 }
 
-                var type = '';
-                var selected = pickPreferredStream(groups.direct);
-                if (selected) type = 'direct';
-                else {
-                    selected = pickPreferredStream(groups.hls);
-                    if (selected) type = 'hls';
-                    else {
-                        selected = pickPreferredStream(groups.dash);
-                        if (selected) type = 'dash';
-                    }
-                }
-
-                if (!selected || !selected.url) return done(new Error('vk-stream'));
-
-                var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
-                    (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
-                var result = {
-                    url: playUrl,
-                    title: item.title,
-                    card: context.movie,
-                    capsule_trailer: true,
-                    capsule_source: type === 'direct' ? 'vk-direct' : 'vk-' + type,
-                    headers: playbackHeaders('vk'),
-                    hls_manifest_timeout: 12000
-                };
-                if (type === 'hls') result.hls_type = 'native';
-
-                var alternatives = [];
-                function addAlternatives(list, alternativeType) {
-                    for (var ai = 0; ai < list.length; ai++) {
-                        var stream = list[ai] || {};
-                        if (!stream.url || stream.url === selected.url) continue;
-                        alternatives.push({
-                            url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
-                                (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
-                            hls_type: alternativeType === 'hls' ? 'native' : '',
-                            headers: playbackHeaders('vk')
-                        });
-                    }
-                }
-                addAlternatives(groups.direct, 'direct');
-                addAlternatives(groups.hls, 'hls');
-                addAlternatives(groups.dash, 'dash');
-                attachAlternateStreams(result, alternatives);
-
-                done(null, result);
+                finishVkResolve(video.files, item, context, done);
             });
         });
 
@@ -1527,6 +1990,17 @@
             var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
             var year = yearOf(movie);
             var query = [title, year, 'трейлер'].join(' ').replace(/\s+/g, ' ');
+
+            if (isBrowserHttpTransport()) {
+                var publicUrl = 'https://vk.com/video?q=' + encodeURIComponent(query);
+                return textRequest(publicUrl, 6500, function (error, text) {
+                    if (error || !text) return done(error || new Error('vk-public-search'), []);
+                    var items = normalizeVkPublicSearch(text, movie);
+                    if (!items.length) return done(new Error('vk-public-search-empty'), []);
+                    done(null, items);
+                });
+            }
+
             var cancelled = false;
             var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
                 if (cancelled) return;
