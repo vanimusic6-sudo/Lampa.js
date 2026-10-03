@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.8.0';
+    var VERSION = '2.9.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v10';
+    var CACHE_KEY = 'capsule_trailer_cache_v11';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -132,6 +132,7 @@
         if (!text) return true;
 
         if (/(обзор|реакци|разбор|рецензи|мнение|объяснен|пасхалк|теори|интервью|саундтрек|soundtrack|review|reaction|breakdown|interview|behind the scenes|making of|featurette|fan made|fanmade|concept trailer|concept teaser|gameplay|walkthrough)/.test(text)) return true;
+        if (/(трейлер игры|трейлер к игре|игровой трейлер|video game trailer|game trailer)/.test(text)) return true;
         if (/(полный фильм|фильм полностью|full movie|watch online|смотреть онлайн)/.test(text)) return true;
         if (/(отрывок|фрагмент|сцена|клип|clip|scene|tv spot)/.test(text)) return true;
 
@@ -348,7 +349,7 @@
         var duration = parseInt(item.duration, 10) || 0;
         var kind = item.kind || trailerKind(item.title);
         if (!kind && !exactMovieMatch) return -9999;
-        if (!exactMovieMatch && noisyTrailerTitle(item.title, movie)) return -9999;
+        if (noisyTrailerTitle(item.title, movie)) return -9999;
 
         if (duration) {
             if (kind === 'teaser' && (duration < 8 || duration > (exactMovieMatch ? 360 : 240))) return -9999;
@@ -788,6 +789,9 @@
 
             var trailerIdMatch = url.match(/\/trailer\/(\d+)/i);
             var title = raw.name || 'Трейлер';
+            var kpKind = trailerKind(title);
+            if (!kpKind || noisyTrailerTitle(title, movie)) continue;
+
             var item = {
                 id: 'kinopoisk:' + (trailerIdMatch ? trailerIdMatch[1] : i),
                 canonical: 'kinopoisk:' + url,
@@ -796,12 +800,12 @@
                 title: title,
                 description: '',
                 duration: 0,
-                thumbnail: imageUrl(movie),
+                thumbnail: '',
                 author: '',
                 language: inferLanguage({ title: title }),
                 qualityHint: '',
                 year: yearOf(movie),
-                kind: trailerKind(title) || 'trailer',
+                kind: kpKind,
                 official: /официальн|official/i.test(String(title || '')),
                 kinopoiskId: String(kpId || ''),
                 kinopoiskWidget: url,
@@ -813,7 +817,7 @@
         }
 
         out = dedupeCandidates(out);
-        return out.slice(0, 8);
+        return out.slice(0, 4);
     }
 
     function normalizeKinopoiskWidgetUrl(value) {
@@ -1417,14 +1421,6 @@
             },
             create: function (callVideo) {
                 var object = $('<div class="capsule-kinopoisk-player"></div>');
-                var loader = $('' +
-                    '<div class="capsule-kinopoisk-loader">' +
-                        '<div class="capsule-kinopoisk-loader__spinner"></div>' +
-                        '<div class="capsule-kinopoisk-loader__text">Загрузка трейлера…</div>' +
-                    '</div>'
-                );
-                object.append(loader);
-
                 var video = object[0];
                 var listener = Lampa.Subscribe();
                 var frame = null;
@@ -1445,14 +1441,10 @@
                 var lastRemoteClock = 0;
                 var metadataRequest = new Lampa.Reguest();
 
-                function setLoader(status, text) {
-                    if (text) loader.find('.capsule-kinopoisk-loader__text').text(text);
-                    loader.toggleClass('hide', !status);
-                }
+                function setLoader() {}
 
                 function hideLoader() {
                     clearTimeout(loaderFallbackTimer);
-                    setLoader(false);
                 }
 
                 function stopClock() {
@@ -1720,7 +1712,7 @@
                         var firstReady = !ready;
                         ready = true;
                         clearTimeout(initTimer);
-                        setLoader(true, 'Запускаем трейлер…');
+                        setLoader(true);
                         if (firstReady) {
                             listener.send('canplay');
                             listener.send('loadeddata');
@@ -1764,7 +1756,7 @@
                     }
 
                     if (type === 'bufferingstarted' || type === 'buffering') {
-                        setLoader(true, 'Буферизация трейлера…');
+                        setLoader(true);
                         stopClock();
                         listener.send('waiting');
                         return;
@@ -1813,10 +1805,10 @@
                             listener.send('loadeddata');
                         }
 
-                        setLoader(true, 'Запускаем трейлер…');
+                        setLoader(true);
                         clearTimeout(loaderFallbackTimer);
                         loaderFallbackTimer = setTimeout(function () {
-                            setLoader(true, 'Кинопоиск всё ещё загружает трейлер…');
+                            setLoader(true);
                         }, 4500);
 
                         post('setVolume', { volume: muted ? 0 : volume });
@@ -1830,7 +1822,6 @@
                     };
 
                     object.append(frame);
-                    object.append(loader);
 
                     initTimer = setTimeout(function () {
                         if (ready || !frame) return;
@@ -2078,57 +2069,49 @@
         style.textContent = '' +
             '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box}' +
             '.capsule-kinopoisk-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
-            '.capsule-kinopoisk-player iframe{position:absolute;top:0;right:0;bottom:0;left:0;z-index:1}' +
-            '.capsule-kinopoisk-loader{position:absolute;top:0;right:0;bottom:0;left:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,.42);pointer-events:none;transition:opacity .16s ease}' +
-            '.capsule-kinopoisk-loader.hide{opacity:0;visibility:hidden}' +
-            '.capsule-kinopoisk-loader__spinner{width:2.8em;height:2.8em;border:.22em solid rgba(255,255,255,.22);border-top-color:#fff;border-radius:50%;animation:capsule-kinopoisk-spin .8s linear infinite}' +
-            '.capsule-kinopoisk-loader__text{font-size:1em;margin-top:1em;opacity:.72}' +
-            '@keyframes capsule-kinopoisk-spin{to{transform:rotate(360deg)}}' +
-
-            '.capsule-trailer{width:100%;box-sizing:border-box;color:inherit;padding-bottom:3em}' +
-            '.capsule-trailer__hero{position:relative;width:100%;height:24em;overflow:hidden;background:#18191b}' +
-            '.capsule-trailer__backdrop{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.92}' +
-            '.capsule-trailer__hero:after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(18,19,21,.04) 0%,rgba(18,19,21,.18) 45%,rgba(18,19,21,.82) 78%,#18191b 100%)}' +
-            '.capsule-trailer__hero-info{position:absolute;z-index:2;left:2.2em;right:2.2em;bottom:2.05em;max-width:74em;margin:0 auto}' +
-            '.capsule-trailer__hero-icon{display:none}' +
-            '.capsule-trailer__title{font-size:2.45em;font-weight:650;line-height:1.05;letter-spacing:-.02em;text-shadow:0 .05em .25em rgba(0,0,0,.45)}' +
-            '.capsule-trailer__sub{font-size:1em;opacity:.68;margin-top:.6em}' +
-
-            '.capsule-trailer__summary{display:flex;align-items:center;justify-content:space-between;max-width:78em;margin:0 auto;padding:1.2em 2.2em .65em;box-sizing:border-box}' +
-            '.capsule-trailer__status{font-size:1em;opacity:.66;min-width:0}' +
-            '.capsule-trailer__sort{font-size:.9em;opacity:.42;margin-left:1em;white-space:nowrap}' +
-            '.capsule-trailer__results{max-width:78em;margin:0 auto;padding:0 2.2em 5em;box-sizing:border-box}' +
-
-            '.capsule-trailer__item{display:flex;align-items:center;position:relative;padding:.72em;border:1px solid transparent;border-radius:.82em;margin:.2em 0;transition:background-color .12s ease,border-color .12s ease,transform .12s ease;box-sizing:border-box}' +
-            '.capsule-trailer__item+.capsule-trailer__item:before{content:"";position:absolute;left:12.2em;right:.7em;top:-.1em;height:1px;background:rgba(255,255,255,.055)}' +
-            '.capsule-trailer__item--best{background:rgba(255,255,255,.035)}' +
-            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.18)}' +
-            '.capsule-trailer__item.focus{transform:scale(1.008)}' +
-            '.capsule-trailer__thumb{width:10.5em;height:5.9em;object-fit:cover;border-radius:.72em;background:rgba(255,255,255,.07);flex:0 0 auto;margin-right:1em}' +
-            '.capsule-trailer__thumb--empty{display:flex;align-items:center;justify-content:center}' +
-            '.capsule-trailer__thumb--empty svg{width:2.7em;height:2.7em;opacity:.65}' +
-            '.capsule-trailer__meta{min-width:0;flex:1}' +
-            '.capsule-trailer__name{font-size:1.06em;font-weight:500;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
-            '.capsule-trailer__line{font-size:.86em;opacity:.56;margin-top:.38em;line-height:1.35}' +
-            '.capsule-trailer__empty{padding:2em .2em;opacity:.65;font-size:1.05em}' +
-            '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.72em 1.05em;border-radius:.7em;background:rgba(255,255,255,.1);margin-top:.8em}' +
-
+            '.capsule-kinopoisk-player iframe{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;border:0}' +
+            '.capsule-trailer{width:100%;box-sizing:border-box;color:inherit;padding-bottom:4em;background:#1b1c1e}' +
+            '.capsule-trailer__hero{position:relative;width:100%;height:20em;overflow:hidden;background:#1b1c1e}' +
+            '.capsule-trailer__backdrop{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 34%;opacity:.86;transform:scale(1.015)}' +
+            '.capsule-trailer__hero:before{content:"";position:absolute;z-index:1;inset:0;background:linear-gradient(90deg,rgba(27,28,30,.22) 0%,rgba(27,28,30,0) 48%,rgba(27,28,30,.08) 100%)}' +
+            '.capsule-trailer__hero:after{content:"";position:absolute;z-index:1;left:0;right:0;top:28%;bottom:-1px;background:linear-gradient(180deg,rgba(27,28,30,0) 0%,rgba(27,28,30,.16) 26%,rgba(27,28,30,.62) 66%,#1b1c1e 100%)}' +
+            '.capsule-trailer__hero-info{position:absolute;z-index:2;left:2.2em;right:2.2em;bottom:1.15em;max-width:73em;margin:0 auto}' +
+            '.capsule-trailer__title{font-size:1.95em;font-weight:600;line-height:1.08;letter-spacing:-.015em;text-shadow:0 .05em .28em rgba(0,0,0,.5)}' +
+            '.capsule-trailer__sub{font-size:.92em;opacity:.62;margin-top:.48em}' +
+            '.capsule-trailer__summary{display:flex;align-items:center;justify-content:space-between;max-width:76em;margin:0 auto;padding:.72em 2.2em .5em;box-sizing:border-box}' +
+            '.capsule-trailer__status{font-size:.94em;opacity:.6;min-width:0}' +
+            '.capsule-trailer__sort{font-size:.84em;opacity:.35;margin-left:1em;white-space:nowrap}' +
+            '.capsule-trailer__results{max-width:76em;margin:0 auto;padding:0 2.2em 6em;box-sizing:border-box}' +
+            '.capsule-trailer__item{display:flex;align-items:center;position:relative;padding:.72em .35em;margin:0;border-radius:.65em;transition:background-color .12s ease,transform .12s ease;box-sizing:border-box}' +
+            '.capsule-trailer__item:after{content:"";position:absolute;left:11.5em;right:.35em;bottom:0;height:1px;background:rgba(255,255,255,.055)}' +
+            '.capsule-trailer__item:last-child:after{display:none}' +
+            '.capsule-trailer__item--best{background:transparent}' +
+            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.095)}' +
+            '.capsule-trailer__item.focus{transform:scale(1.006)}' +
+            '.capsule-trailer__thumb{width:10.15em;height:5.7em;object-fit:cover;border-radius:.72em;background:rgba(255,255,255,.055);flex:0 0 auto;margin-right:1em}' +
+            '.capsule-trailer__thumb--empty{display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.7)}' +
+            '.capsule-trailer__thumb--empty svg{width:3em;height:3em;opacity:.72}' +
+            '.capsule-trailer__meta{min-width:0;flex:1;padding-right:.3em}' +
+            '.capsule-trailer__name{font-size:1.02em;font-weight:500;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.capsule-trailer__line{font-size:.82em;opacity:.52;margin-top:.34em;line-height:1.35}' +
+            '.capsule-trailer__empty{padding:1.7em .35em;opacity:.62;font-size:1em}' +
+            '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.68em 1em;border-radius:.65em;background:rgba(255,255,255,.095);margin-top:.8em}' +
             '.view--capsule-trailer svg{width:1.55em;height:1.55em}' +
-            '.settings-param[data-name="capsule_trailer_settings"] svg{width:1.35em;height:1.35em}' +
-
-            'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:11em}' +
-            'body.true--mobile.orientation--landscape .capsule-trailer__results{padding-right:11em}' +
+            'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:14em}' +
+            'body.true--mobile.orientation--landscape .capsule-trailer__results{padding-right:12em}' +
             '@media(max-width:700px){' +
-                '.capsule-trailer__hero{height:19em}' +
-                '.capsule-trailer__hero-info{left:1.15em;right:1.15em;bottom:1.45em}' +
-                '.capsule-trailer__title{font-size:2em}' +
-                '.capsule-trailer__summary{padding:1em 1.1em .55em}' +
-                '.capsule-trailer__results{padding:0 1.05em 4em}' +
-                '.capsule-trailer__item{padding:.62em .2em;border-radius:.72em}' +
-                '.capsule-trailer__item+.capsule-trailer__item:before{left:8.65em;right:.2em}' +
-                '.capsule-trailer__thumb{width:7.8em;height:4.39em;margin-right:.75em;border-radius:.6em}' +
-                '.capsule-trailer__name{font-size:.98em}' +
-                '.capsule-trailer__line{font-size:.8em}' +
+                '.capsule-trailer__hero{height:15.2em}' +
+                '.capsule-trailer__hero-info{left:1.25em;right:1.25em;bottom:.85em}' +
+                '.capsule-trailer__title{font-size:1.55em}' +
+                '.capsule-trailer__sub{font-size:.86em;margin-top:.38em}' +
+                '.capsule-trailer__summary{padding:.62em 1.25em .38em}' +
+                '.capsule-trailer__results{padding:0 1.05em 5em}' +
+                '.capsule-trailer__item{padding:.62em .2em}' +
+                '.capsule-trailer__item:after{left:7.9em;right:.2em}' +
+                '.capsule-trailer__thumb{width:7em;height:3.94em;margin-right:.7em;border-radius:.58em}' +
+                '.capsule-trailer__thumb--empty svg{width:2.35em;height:2.35em}' +
+                '.capsule-trailer__name{font-size:.95em}' +
+                '.capsule-trailer__line{font-size:.77em;margin-top:.28em}' +
                 '.capsule-trailer__sort{display:none}' +
             '}';
         document.head.appendChild(style);
@@ -2411,7 +2394,6 @@
                 try { resolvingCancel(); } catch (e) {}
                 resolvingCancel = null;
             }
-            status.text('Подготовка видео…');
             self.activity.loader(true);
             var settled = false;
             var cancelResolve = provider.resolve(item, context, function (error, data) {
@@ -2420,11 +2402,9 @@
                 if (!alive) return;
                 self.activity.loader(false);
                 if (error || !data || !data.url) {
-                    status.text('Не удалось подготовить видео');
                     Lampa.Noty.show('CAPSULE Trailer: видео недоступно');
                     return;
                 }
-                status.text('Запуск трейлера…');
                 try {
                     Lampa.Player.play(data);
                 }
