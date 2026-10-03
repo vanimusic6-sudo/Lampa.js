@@ -12,8 +12,8 @@
  *
  * Discovery / playback layers:
  * - Direct trailer URLs already present in Lampa movie metadata.
- * - Kinopoisk API Unofficial metadata + Kinopoisk trailer widget/stream metadata.
  * - OK.ru is the primary trailer source.
+ * - VK Video and Dzen are isolated anonymous experimental providers.
  *
  */
 (function () {
@@ -22,9 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '2.9.0';
+    var VERSION = '3.0.0';
     var COMPONENT = 'capsule_trailer';
-    var CACHE_KEY = 'capsule_trailer_cache_v11';
+    var CACHE_KEY = 'capsule_trailer_cache_v12';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -573,8 +573,8 @@
     function playbackHeaders(source) {
         var headers = { 'User-Agent': 'Mozilla/5.0' };
         if (source === 'ok') headers.Referer = 'https://ok.ru/';
-        else if (source === 'yandex') headers.Referer = 'https://yandex.ru/';
-        else if (source === 'kinopoisk') headers.Referer = 'https://www.kinopoisk.ru/';
+        else if (source === 'vk') headers.Referer = 'https://vkvideo.ru/';
+        else if (source === 'dzen') headers.Referer = 'https://dzen.ru/';
         return headers;
     }
 
@@ -675,221 +675,6 @@
             done(null, data);
             return function () {};
         }
-    };
-
-    function kinopoiskApiKey() {
-        var value = Lampa.Storage.field('capsule_trailer_kinopoisk_key');
-        if (value === undefined || value === null || String(value) === 'undefined') return '';
-        return String(value).replace(/^\s+|\s+$/g, '');
-    }
-
-    function kinopoiskRequest(path, timeout, done) {
-        var key = kinopoiskApiKey();
-        if (!key) {
-            done(new Error('kinopoisk-key'));
-            return function () {};
-        }
-
-        return nativeRequest('https://kinopoiskapiunofficial.tech' + path, timeout, done, {
-            'Accept': 'application/json',
-            'X-API-KEY': key
-        });
-    }
-
-    function kinopoiskTypeMatches(type, movie) {
-        type = String(type || '').toUpperCase();
-        if (!type) return true;
-        if (mediaType(movie) === 'tv') return type === 'TV_SERIES' || type === 'MINI_SERIES' || type === 'TV_SHOW';
-        return type === 'FILM' || type === 'VIDEO';
-    }
-
-    function kinopoiskMovieScore(raw, movie) {
-        raw = raw || {};
-        var candidates = [raw.nameRu, raw.nameEn, raw.nameOriginal];
-        var variants = titleVariants(movie);
-        var best = 0;
-
-        for (var i = 0; i < candidates.length; i++) {
-            if (!candidates[i]) continue;
-            var candidate = cleanText(candidates[i]);
-            for (var j = 0; j < variants.length; j++) {
-                var c = coverage(candidate, variants[j]);
-                var value = Math.round(c * 100);
-                if (candidate === variants[j]) value += 120;
-                else if (candidate.indexOf(variants[j]) >= 0 || variants[j].indexOf(candidate) >= 0) value += 45;
-                if (value > best) best = value;
-            }
-        }
-
-        var wantedYear = yearOf(movie);
-        var gotYear = String(raw.year || '');
-        if (wantedYear && gotYear) {
-            if (wantedYear === gotYear) best += 55;
-            else if (Math.abs(parseInt(wantedYear, 10) - parseInt(gotYear, 10)) <= 1) best += 8;
-            else best -= 90;
-        }
-
-        if (kinopoiskTypeMatches(raw.type, movie)) best += 25;
-        else best -= 55;
-
-        return best;
-    }
-
-    function findKinopoiskId(movie, done) {
-        if (movie && movie.kinopoisk_id && /^\d+$/.test(String(movie.kinopoisk_id))) {
-            done(null, String(movie.kinopoisk_id));
-            return function () {};
-        }
-
-        var title = movie && (movie.title || movie.name || movie.original_title || movie.original_name) || '';
-        if (!title) {
-            done(new Error('kinopoisk-title'));
-            return function () {};
-        }
-
-        return kinopoiskRequest('/api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(title) + '&page=1', SEARCH_TIMEOUT, function (error, data) {
-            if (error || !data || !data.films || Object.prototype.toString.call(data.films) !== '[object Array]') {
-                done(error || new Error('kinopoisk-search'));
-                return;
-            }
-
-            var best = null;
-            var bestScore = -9999;
-            for (var i = 0; i < data.films.length; i++) {
-                var raw = data.films[i] || {};
-                var score = kinopoiskMovieScore(raw, movie);
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = raw;
-                }
-            }
-
-            if (!best || !best.filmId || bestScore < 70) {
-                done(new Error('kinopoisk-no-match'));
-                return;
-            }
-
-            done(null, String(best.filmId));
-        });
-    }
-
-    function normalizeKinopoiskVideos(data, movie, kpId) {
-        var out = [];
-        var items = data && data.items;
-        if (!items || Object.prototype.toString.call(items) !== '[object Array]') return out;
-
-        for (var i = 0; i < items.length; i++) {
-            var raw = items[i] || {};
-            var site = String(raw.site || '').toUpperCase();
-
-            if (site !== 'KINOPOISK_WIDGET') continue;
-
-            var url = decodeHtmlEntities(raw.url || '');
-            if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(url)) continue;
-
-            var trailerIdMatch = url.match(/\/trailer\/(\d+)/i);
-            var title = raw.name || 'Трейлер';
-            var kpKind = trailerKind(title);
-            if (!kpKind || noisyTrailerTitle(title, movie)) continue;
-
-            var item = {
-                id: 'kinopoisk:' + (trailerIdMatch ? trailerIdMatch[1] : i),
-                canonical: 'kinopoisk:' + url,
-                provider: 'kinopoisk',
-                providerName: 'Кинопоиск',
-                title: title,
-                description: '',
-                duration: 0,
-                thumbnail: '',
-                author: '',
-                language: inferLanguage({ title: title }),
-                qualityHint: '',
-                year: yearOf(movie),
-                kind: kpKind,
-                official: /официальн|official/i.test(String(title || '')),
-                kinopoiskId: String(kpId || ''),
-                kinopoiskWidget: url,
-                transportScore: 55,
-                exactMovieMatch: true
-            };
-            item.score = scoreCandidate(item, movie, true);
-            out.push(item);
-        }
-
-        out = dedupeCandidates(out);
-        return out.slice(0, 4);
-    }
-
-    function normalizeKinopoiskWidgetUrl(value) {
-        var widget = decodeHtmlEntities(value || '');
-        if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(widget)) return '';
-
-        if (widget.indexOf('onlyPlayer=') < 0) widget += (widget.indexOf('?') >= 0 ? '&' : '?') + 'onlyPlayer=1';
-        if (widget.indexOf('autoplay=') < 0) widget += '&autoplay=1';
-        if (widget.indexOf('cover=') < 0) widget += '&cover=1';
-        if (widget.indexOf('tv=') < 0) widget += '&tv=1';
-
-        return widget;
-    }
-
-    function resolveKinopoisk(item, context, done) {
-        var widget = normalizeKinopoiskWidgetUrl(item.kinopoiskWidget || item.url || '');
-        if (!widget) {
-            done(new Error('kinopoisk-widget'));
-            return function () {};
-        }
-
-        done(null, {
-            url: widget,
-            title: item.title,
-            card: context.movie,
-            capsule_trailer: true,
-            capsule_source: 'kinopoisk-widget'
-        });
-
-        return function () {};
-    }
-
-    var KinopoiskProvider = {
-        id: 'kinopoisk',
-        name: 'Кинопоиск',
-        tier: 'experimental',
-        autoplay: false,
-        search: function (context, done) {
-            if (!settingEnabled('capsule_trailer_kinopoisk', true) || !kinopoiskApiKey()) {
-                done(null, []);
-                return function () {};
-            }
-
-            var movie = context.movie || {};
-            var key = 'kinopoisk:' + movieKey(movie);
-            var cached = cacheGet(key);
-            if (cached) {
-                done(null, cached);
-                return function () {};
-            }
-
-            var cancelled = false;
-            var cancelCurrent = findKinopoiskId(movie, function (idError, kpId) {
-                if (cancelled) return;
-                if (idError || !kpId) return done(idError || new Error('kinopoisk-id'), []);
-
-                cancelCurrent = kinopoiskRequest('/api/v2.2/films/' + encodeURIComponent(kpId) + '/videos', SEARCH_TIMEOUT, function (videoError, data) {
-                    if (cancelled) return;
-                    if (videoError || !data) return done(videoError || new Error('kinopoisk-videos'), []);
-
-                    var items = normalizeKinopoiskVideos(data, movie, kpId);
-                    cachePut(key, items);
-                    done(null, items);
-                });
-            });
-
-            return function () {
-                cancelled = true;
-                if (cancelCurrent) cancelCurrent();
-            };
-        },
-        resolve: resolveKinopoisk
     };
 
     function decodeHtmlEntities(value) {
@@ -1195,7 +980,620 @@
         resolve: resolveOk
     };
 
-    var PROVIDERS = [NativeDirectProvider, KinopoiskProvider, OkProvider];
+    function dzenVideoId(value) {
+        var match = String(value || '').match(/\/video\/watch\/([0-9a-z_-]+)/i);
+        return match ? match[1] : '';
+    }
+
+    function dzenThumbnail(image) {
+        image = image || {};
+        if (image.url) return String(image.url);
+        var template = String(image.urlTemplate || '');
+        var namespace = String(image.namespace || '');
+        if (!template || !namespace) return '';
+        return template
+            .replace('{namespace}', namespace)
+            .replace('{size}', String(image.sizeName || 'scale_1200'));
+    }
+
+    function dzenDimensions(video) {
+        video = video || {};
+        var width = parseInt(video.width, 10) || 0;
+        var height = parseInt(video.height, 10) || 0;
+        var resolutions = video.resolutions;
+        if (Object.prototype.toString.call(resolutions) === '[object Array]') {
+            for (var i = 0; i < resolutions.length; i++) {
+                var row = resolutions[i] || {};
+                var rw = parseInt(row.width, 10) || 0;
+                var rh = parseInt(row.height, 10) || 0;
+                if (rw > width) {
+                    width = rw;
+                    height = rh;
+                }
+            }
+        }
+        return { width: width, height: height };
+    }
+
+    function normalizeDzenSearch(data, movie) {
+        var feed = data && (data.feedData || data);
+        var rows = feed && feed.items;
+        var out = [];
+        var seen = {};
+        if (Object.prototype.toString.call(rows) !== '[object Array]') return out;
+
+        for (var i = 0; i < rows.length && out.length < 8; i++) {
+            var raw = rows[i] || {};
+            var video = raw.video || {};
+            var id = dzenVideoId(raw.link || '');
+            var title = decodeHtmlEntities(raw.title || '');
+            if (!id || !title || seen[id]) continue;
+
+            var dimensions = dzenDimensions(video);
+            var item = {
+                id: 'dzen:' + id,
+                canonical: 'dzen:' + id,
+                provider: 'dzen',
+                providerName: 'Дзен',
+                title: title,
+                description: '',
+                duration: parseInt(video.duration, 10) || 0,
+                thumbnail: dzenThumbnail(raw.image),
+                author: '',
+                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
+                qualityHint: dimensions.height ? dimensions.height + 'p' : '',
+                year: '',
+                kind: trailerKind(title),
+                official: /официальн|official/i.test(title),
+                dzenId: id,
+                dzenVideo: video,
+                url: 'https://dzen.ru/video/watch/' + id,
+                transportScore: 66,
+                exactMovieMatch: false
+            };
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) {
+                seen[id] = true;
+                out.push(item);
+            }
+        }
+
+        out = dedupeCandidates(out);
+        return out.slice(0, 5);
+    }
+
+    function parseDzenDuration(value) {
+        var parts = String(value || '').split(':');
+        var seconds = 0;
+        for (var i = 0; i < parts.length; i++) {
+            var part = parseInt(parts[i], 10);
+            if (isNaN(part)) return 0;
+            seconds = seconds * 60 + part;
+        }
+        return seconds;
+    }
+
+    function normalizeDzenHtml(text, movie) {
+        text = String(text || '');
+        var marker = 'https://dzen.ru/video/watch/';
+        var cursor = 0;
+        var out = [];
+        var seen = {};
+
+        while (out.length < 6) {
+            var linkAt = text.indexOf(marker, cursor);
+            if (linkAt < 0) break;
+
+            var idStart = linkAt + marker.length;
+            var idEnd = idStart;
+            while (idEnd < text.length && /[0-9a-z_-]/i.test(text.charAt(idEnd))) idEnd++;
+            var id = text.slice(idStart, idEnd);
+            cursor = idEnd;
+
+            if (!id || seen[id]) continue;
+
+            var articleStart = text.lastIndexOf('<article', linkAt);
+            var articleEnd = text.indexOf('</article>', linkAt);
+            if (articleStart < 0 || articleEnd < 0 || articleEnd - articleStart > 80000) continue;
+
+            var card = text.slice(articleStart, articleEnd);
+            var titleMatch = card.match(/data-testid=["']card-part-title["'][^>]*>([^<]+)/i);
+            if (!titleMatch) titleMatch = card.match(/aria-label=["']([^"']+)["'][^>]*[^>]*href=["'][^"']*\/video\/watch\//i);
+            var title = decodeHtmlEntities(titleMatch ? titleMatch[1] : '');
+            if (!title) continue;
+
+            var durationMatch = card.match(/aria-label=["']Общая длительность видео["'][^>]*>([^<]+)/i);
+            var thumbnailMatch = card.match(/background-image\s*:\s*url\(([^)]+)\)/i);
+            var thumbnail = thumbnailMatch ? String(thumbnailMatch[1] || '').replace(/^["']|["']$/g, '') : '';
+
+            var item = {
+                id: 'dzen:' + id,
+                canonical: 'dzen:' + id,
+                provider: 'dzen',
+                providerName: 'Дзен',
+                title: title,
+                description: '',
+                duration: durationMatch ? parseDzenDuration(durationMatch[1]) : 0,
+                thumbnail: decodeHtmlEntities(thumbnail),
+                author: '',
+                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
+                qualityHint: '',
+                year: '',
+                kind: trailerKind(title),
+                official: /официальн|official/i.test(title),
+                dzenId: id,
+                url: marker + id,
+                transportScore: 62,
+                exactMovieMatch: false
+            };
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) {
+                seen[id] = true;
+                out.push(item);
+            }
+        }
+
+        out = dedupeCandidates(out);
+        return out.slice(0, 5);
+    }
+
+    function jsonObjectAt(text, start) {
+        var depth = 0;
+        var string = false;
+        var escaped = false;
+
+        for (var i = start; i < text.length; i++) {
+            var current = text.charAt(i);
+
+            if (string) {
+                if (escaped) escaped = false;
+                else if (current === '\\') escaped = true;
+                else if (current === '"') string = false;
+                continue;
+            }
+
+            if (current === '"') string = true;
+            else if (current === '{') depth++;
+            else if (current === '}' && --depth === 0) return text.slice(start, i + 1);
+        }
+
+        return '';
+    }
+
+    function dzenVideoFromPage(text) {
+        text = String(text || '');
+        var metadata = text.indexOf('"videoMetaResponse"');
+        var params = metadata < 0 ? -1 : text.lastIndexOf('var _params', metadata);
+        var start = params < 0 ? -1 : text.indexOf('{', params);
+        if (start < 0) return null;
+
+        var json = jsonObjectAt(text, start);
+        if (!json) return null;
+
+        try {
+            var root = JSON.parse(json);
+            return root && root.ssrData && root.ssrData.videoMetaResponse && root.ssrData.videoMetaResponse.video || null;
+        }
+        catch (e) {
+            return null;
+        }
+    }
+
+    function dzenStreamGroups(video) {
+        video = video || {};
+        var direct = [];
+        var hls = [];
+        var dash = [];
+
+        function push(url, height) {
+            url = String(url || '');
+            if (!/^https?:\/\//i.test(url)) return;
+            var entry = { url: url, height: parseInt(height, 10) || yandexTypeHeight(url) || 0 };
+            if (/\.m3u8(?:[?#]|$)|[?&]ct=8(?:&|$)/i.test(url)) hls.push(entry);
+            else if (/\.mpd(?:[?#]|$)|[?&]ct=6(?:&|$)/i.test(url)) dash.push(entry);
+            else direct.push(entry);
+        }
+
+        push(video.id, 0);
+
+        var streams = video.streams;
+        if (Object.prototype.toString.call(streams) === '[object Array]') {
+            for (var i = 0; i < streams.length; i++) push(streams[i], 0);
+        }
+
+        var one = video.oneVideoStreams;
+        if (Object.prototype.toString.call(one) === '[object Array]') {
+            var qualityMap = { ultra:2160, quad:1440, fullhd:1080, full:1080, hd:720, sd:480, low:360, lowest:240, mobile:144 };
+            for (var j = 0; j < one.length; j++) {
+                var row = one[j] || {};
+                push(row.url, qualityMap[String(row.type || '').toLowerCase()] || qualityNumber(row.type));
+            }
+        }
+
+        return { direct: direct, hls: hls, dash: dash };
+    }
+
+    function finishDzenResolve(video, item, context, done) {
+        var groups = dzenStreamGroups(video);
+        var type = '';
+        var selected = pickPreferredStream(groups.direct);
+
+        if (selected) type = 'direct';
+        else {
+            selected = pickPreferredStream(groups.hls);
+            if (selected) type = 'hls';
+            else {
+                selected = pickPreferredStream(groups.dash);
+                if (selected) type = 'dash';
+            }
+        }
+
+        if (!selected || !selected.url) {
+            done(new Error('dzen-stream'));
+            return;
+        }
+
+        var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+            (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
+
+        var result = {
+            url: playUrl,
+            title: item.title,
+            card: context.movie,
+            capsule_trailer: true,
+            capsule_source: type === 'direct' ? 'dzen-direct' : 'dzen-' + type,
+            headers: playbackHeaders('dzen'),
+            hls_manifest_timeout: 12000
+        };
+        if (type === 'hls') result.hls_type = 'native';
+
+        var alternatives = [];
+        function addAlternatives(list, alternativeType) {
+            for (var i = 0; i < list.length; i++) {
+                var stream = list[i] || {};
+                if (!stream.url || stream.url === selected.url) continue;
+                alternatives.push({
+                    url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
+                        (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
+                    hls_type: alternativeType === 'hls' ? 'native' : '',
+                    headers: playbackHeaders('dzen')
+                });
+            }
+        }
+        addAlternatives(groups.direct, 'direct');
+        addAlternatives(groups.hls, 'hls');
+        addAlternatives(groups.dash, 'dash');
+        attachAlternateStreams(result, alternatives);
+
+        done(null, result);
+    }
+
+    function resolveDzen(item, context, done) {
+        var immediate = dzenStreamGroups(item.dzenVideo || {});
+        if (immediate.direct.length || immediate.hls.length || immediate.dash.length) {
+            finishDzenResolve(item.dzenVideo, item, context, done);
+            return function () {};
+        }
+
+        var page = item.url || ('https://dzen.ru/video/watch/' + item.dzenId);
+        return textRequest(page, 6000, function (error, text) {
+            if (error || !text) return done(error || new Error('dzen-page'));
+            var video = dzenVideoFromPage(text);
+            if (!video) return done(new Error('dzen-metadata'));
+            finishDzenResolve(video, item, context, done);
+        }, playbackHeaders('dzen'));
+    }
+
+    var DzenProvider = {
+        id: 'dzen',
+        name: 'Дзен',
+        tier: 'experimental',
+        autoplay: false,
+        search: function (context, done) {
+            if (!settingEnabled('capsule_trailer_dzen', true)) {
+                done(null, []);
+                return function () {};
+            }
+
+            var movie = context.movie || {};
+            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+            var year = yearOf(movie);
+            var query = [title, year, 'трейлер'].join(' ').replace(/\s+/g, ' ');
+            var jsonUrl = 'https://dzen.ru/api/web/v1/zen-search' +
+                '?country_code=ru&forced_request_type=long_video_search' +
+                '&query=' + encodeURIComponent(query) +
+                '&clid=1400&type_filter=video&lang=ru';
+            var htmlUrl = 'https://dzen.ru/search?query=' + encodeURIComponent(query) + '&type_filter=video';
+            var cancelled = false;
+            var cancelCurrent = nativeRequest(jsonUrl, 5500, function (error, data) {
+                if (cancelled) return;
+                var items = !error ? normalizeDzenSearch(data, movie) : [];
+
+                if (items.length) {
+                    done(null, items);
+                    return;
+                }
+
+                cancelCurrent = textRequest(htmlUrl, 5500, function (htmlError, text) {
+                    if (cancelled) return;
+                    if (htmlError || !text) return done(htmlError || error || new Error('dzen-search'), []);
+                    done(null, normalizeDzenHtml(text, movie));
+                }, playbackHeaders('dzen'));
+            });
+
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
+        },
+        resolve: resolveDzen
+    };
+
+    var VK_CLIENT_ID = '52461373';
+    var VK_API_VERSION = '5.282';
+    var vkAnonymous = { token: '', expires: 0 };
+
+    function vkAnonymousToken(done) {
+        var now = Math.floor(Date.now() / 1000);
+        if (vkAnonymous.token && now + 60 < vkAnonymous.expires) {
+            done(null, vkAnonymous.token);
+            return function () {};
+        }
+
+        return postRequest(
+            'https://login.vk.com/?act=get_anonym_token',
+            'json',
+            5500,
+            'client_id=' + encodeURIComponent(VK_CLIENT_ID),
+            function (error, data) {
+                var root = data || {};
+                var payload = root.data || {};
+                var token = String(payload.access_token || '');
+                if (error || String(root.type || '') !== 'okay' || !token) {
+                    done(error || new Error('vk-anonymous-token'));
+                    return;
+                }
+
+                vkAnonymous.token = token;
+                vkAnonymous.expires = parseInt(payload.expired_at, 10) || now + 600;
+                done(null, token);
+            }
+        );
+    }
+
+    function vkBestImage(images) {
+        if (Object.prototype.toString.call(images) !== '[object Array]') return '';
+        var best = '';
+        var bestWidth = 0;
+        for (var i = 0; i < images.length; i++) {
+            var row = images[i] || {};
+            var url = String(row.url || '');
+            var width = parseInt(row.width, 10) || 0;
+            if (url && width >= bestWidth) {
+                best = url;
+                bestWidth = width;
+            }
+        }
+        return best;
+    }
+
+    function vkMaxHeight(video) {
+        var files = video && video.files || {};
+        var best = 0;
+        for (var key in files) {
+            if (!Object.prototype.hasOwnProperty.call(files, key)) continue;
+            var match = String(key).match(/^mp4_(\d+)$/);
+            if (match && /^https?:\/\//i.test(String(files[key] || ''))) {
+                best = Math.max(best, parseInt(match[1], 10) || 0);
+            }
+        }
+        return best || parseInt(video && video.height, 10) || 0;
+    }
+
+    function normalizeVkSearch(data, movie) {
+        var response = data && data.response;
+        var rows = response && response.catalog_videos;
+        var out = [];
+        var seen = {};
+        if (Object.prototype.toString.call(rows) !== '[object Array]') return out;
+
+        for (var i = 0; i < rows.length && out.length < 8; i++) {
+            var wrapper = rows[i] || {};
+            var video = wrapper.video || {};
+            var owner = String(video.owner_id == null ? '' : video.owner_id);
+            var id = String(video.id == null ? '' : video.id);
+            var title = String(video.title || '');
+            if (!owner || !id || !title) continue;
+
+            var videoId = owner + '_' + id;
+            if (seen[videoId]) continue;
+
+            var height = vkMaxHeight(video);
+            var item = {
+                id: 'vk:' + videoId,
+                canonical: 'vk:' + videoId,
+                provider: 'vk',
+                providerName: 'VK Video',
+                title: title,
+                description: String(video.description || ''),
+                duration: parseInt(video.duration, 10) || 0,
+                thumbnail: vkBestImage(video.image),
+                author: '',
+                language: /русск|дублирован|дубляж/i.test(title) ? 'ru' : '',
+                qualityHint: height ? height + 'p' : '',
+                year: '',
+                kind: trailerKind(title),
+                official: /официальн|official/i.test(title),
+                vkId: videoId,
+                url: 'https://vkvideo.ru/video' + videoId,
+                transportScore: 72,
+                exactMovieMatch: false
+            };
+            item.score = scoreCandidate(item, movie, false);
+            if (item.score >= 0) {
+                seen[videoId] = true;
+                out.push(item);
+            }
+        }
+
+        out = dedupeCandidates(out);
+        return out.slice(0, 5);
+    }
+
+    function vkStreamGroups(files) {
+        files = files || {};
+        var direct = [];
+        var hls = [];
+        var dash = [];
+
+        for (var key in files) {
+            if (!Object.prototype.hasOwnProperty.call(files, key)) continue;
+            var url = String(files[key] || '');
+            if (!/^https?:\/\//i.test(url)) continue;
+
+            var directMatch = String(key).match(/^mp4_(\d+)$/);
+            if (directMatch) {
+                direct.push({ url: url, height: parseInt(directMatch[1], 10) || 0 });
+                continue;
+            }
+
+            if (/^hls/.test(key) && !/live_playback/.test(key)) hls.push({ url: url, height: 0 });
+            else if (/^dash/.test(key) && !/live_playback/.test(key) && key !== 'dash_uni') dash.push({ url: url, height: 0 });
+        }
+
+        return { direct: direct, hls: hls, dash: dash };
+    }
+
+    function resolveVk(item, context, done) {
+        var cancelled = false;
+        var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
+            if (cancelled) return;
+            if (tokenError || !token) return done(tokenError || new Error('vk-token'));
+
+            var url = 'https://api.vk.com/method/video.getByIds?v=' + encodeURIComponent(VK_API_VERSION) +
+                '&client_id=' + encodeURIComponent(VK_CLIENT_ID);
+            var body = 'access_token=' + encodeURIComponent(token) +
+                '&videos=' + encodeURIComponent(item.vkId) +
+                '&video_fields=' + encodeURIComponent('files');
+
+            cancelCurrent = postRequest(url, 'json', 6000, body, function (error, data) {
+                if (cancelled) return;
+
+                if (data && data.error && parseInt(data.error.error_code, 10) === 5) {
+                    vkAnonymous.token = '';
+                    vkAnonymous.expires = 0;
+                }
+
+                var rows = data && data.response && data.response.items;
+                var video = Object.prototype.toString.call(rows) === '[object Array]' ? rows[0] : null;
+                var groups = vkStreamGroups(video && video.files);
+
+                if (error || !video || (!groups.direct.length && !groups.hls.length && !groups.dash.length)) {
+                    done(error || new Error('vk-stream'));
+                    return;
+                }
+
+                var type = '';
+                var selected = pickPreferredStream(groups.direct);
+                if (selected) type = 'direct';
+                else {
+                    selected = pickPreferredStream(groups.hls);
+                    if (selected) type = 'hls';
+                    else {
+                        selected = pickPreferredStream(groups.dash);
+                        if (selected) type = 'dash';
+                    }
+                }
+
+                if (!selected || !selected.url) return done(new Error('vk-stream'));
+
+                var playUrl = type === 'direct' ? capsuleMediaUrl(selected.url, 'direct') :
+                    (type === 'hls' ? capsuleMediaUrl(selected.url, 'hls') : selected.url);
+                var result = {
+                    url: playUrl,
+                    title: item.title,
+                    card: context.movie,
+                    capsule_trailer: true,
+                    capsule_source: type === 'direct' ? 'vk-direct' : 'vk-' + type,
+                    headers: playbackHeaders('vk'),
+                    hls_manifest_timeout: 12000
+                };
+                if (type === 'hls') result.hls_type = 'native';
+
+                var alternatives = [];
+                function addAlternatives(list, alternativeType) {
+                    for (var ai = 0; ai < list.length; ai++) {
+                        var stream = list[ai] || {};
+                        if (!stream.url || stream.url === selected.url) continue;
+                        alternatives.push({
+                            url: alternativeType === 'direct' ? capsuleMediaUrl(stream.url, 'direct') :
+                                (alternativeType === 'hls' ? capsuleMediaUrl(stream.url, 'hls') : stream.url),
+                            hls_type: alternativeType === 'hls' ? 'native' : '',
+                            headers: playbackHeaders('vk')
+                        });
+                    }
+                }
+                addAlternatives(groups.direct, 'direct');
+                addAlternatives(groups.hls, 'hls');
+                addAlternatives(groups.dash, 'dash');
+                attachAlternateStreams(result, alternatives);
+
+                done(null, result);
+            });
+        });
+
+        return function () {
+            cancelled = true;
+            if (cancelCurrent) cancelCurrent();
+        };
+    }
+
+    var VkProvider = {
+        id: 'vk',
+        name: 'VK Video',
+        tier: 'experimental',
+        autoplay: false,
+        search: function (context, done) {
+            if (!settingEnabled('capsule_trailer_vk', true)) {
+                done(null, []);
+                return function () {};
+            }
+
+            var movie = context.movie || {};
+            var title = movie.title || movie.name || movie.original_title || movie.original_name || '';
+            var year = yearOf(movie);
+            var query = [title, year, 'трейлер'].join(' ').replace(/\s+/g, ' ');
+            var cancelled = false;
+            var cancelCurrent = vkAnonymousToken(function (tokenError, token) {
+                if (cancelled) return;
+                if (tokenError || !token) return done(tokenError || new Error('vk-token'), []);
+
+                var url = 'https://api.vkvideo.ru/method/catalog.getVideoSearchWeb2' +
+                    '?v=' + encodeURIComponent(VK_API_VERSION) +
+                    '&client_id=' + encodeURIComponent(VK_CLIENT_ID) +
+                    '&count=30&q=' + encodeURIComponent(query) +
+                    '&content_type=video&access_token=' + encodeURIComponent(token);
+
+                cancelCurrent = nativeRequest(url, 5500, function (error, data) {
+                    if (cancelled) return;
+                    if (data && data.error && parseInt(data.error.error_code, 10) === 5) {
+                        vkAnonymous.token = '';
+                        vkAnonymous.expires = 0;
+                    }
+                    if (error || !data || data.error) return done(error || new Error('vk-search'), []);
+                    done(null, normalizeVkSearch(data, movie));
+                });
+            });
+
+            return function () {
+                cancelled = true;
+                if (cancelCurrent) cancelCurrent();
+            };
+        },
+        resolve: resolveVk
+    };
+
+    var PROVIDERS = [NativeDirectProvider, OkProvider, VkProvider, DzenProvider];
 
     function closeSourceSelectionState() {
         try {
@@ -1410,539 +1808,6 @@
         }
     }
 
-    function registerKinopoiskTube() {
-        if (!Lampa.PlayerVideo || typeof Lampa.PlayerVideo.registerTube !== 'function') return;
-        if (window.capsule_trailer_kinopoisk_tube) return;
-
-        var registration = {
-            name: 'CAPSULE KINOPOISK',
-            verify: function (src) {
-                return /^https?:\/\/widgets\.kinopoisk\.ru\//i.test(String(src || ''));
-            },
-            create: function (callVideo) {
-                var object = $('<div class="capsule-kinopoisk-player"></div>');
-                var video = object[0];
-                var listener = Lampa.Subscribe();
-                var frame = null;
-                var streamUrl = '';
-                var current = 0;
-                var duration = 0;
-                var paused = true;
-                var volume = 1;
-                var muted = false;
-                var ready = false;
-                var wantedPlay = false;
-                var ended = false;
-                var initTimer = null;
-                var loaderFallbackTimer = null;
-                var clockTimer = null;
-                var clockStamp = 0;
-                var clockBase = 0;
-                var lastRemoteClock = 0;
-                var metadataRequest = new Lampa.Reguest();
-
-                function setLoader() {}
-
-                function hideLoader() {
-                    clearTimeout(loaderFallbackTimer);
-                }
-
-                function stopClock() {
-                    clearTimeout(clockTimer);
-                    clockTimer = null;
-                }
-
-                function startClock() {
-                    stopClock();
-                    if (paused || ended || !duration) return;
-
-                    clockBase = current;
-                    clockStamp = Date.now();
-
-                    function tick() {
-                        if (paused || ended || !duration) return;
-
-                        var now = Date.now();
-
-                        if (!lastRemoteClock || now - lastRemoteClock > 1200) {
-                            current = Math.min(duration, clockBase + (now - clockStamp) / 1000);
-                        }
-                        else {
-                            clockBase = current;
-                            clockStamp = now;
-                        }
-
-                        listener.send('timeupdate');
-
-                        if (duration > 0 && current >= duration - 0.15) {
-                            sendEnded();
-                            return;
-                        }
-
-                        clockTimer = setTimeout(tick, 500);
-                    }
-
-                    clockTimer = setTimeout(tick, 500);
-                }
-
-                function applyDuration(value) {
-                    var next = Number(value) || 0;
-                    if (next < 5 || next > 1800) return false;
-
-                    duration = next;
-                    if (current > duration) current = duration;
-
-                    listener.send('timeupdate');
-                    if (!paused && !ended) startClock();
-
-                    return true;
-                }
-
-                function decodeRepeated(value) {
-                    value = String(value || '').replace(/&amp;/gi, '&').replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
-
-                    for (var i = 0; i < 3; i++) {
-                        try {
-                            var decoded = decodeURIComponent(value);
-                            if (decoded === value) break;
-                            value = decoded;
-                        }
-                        catch (e) {
-                            break;
-                        }
-                    }
-
-                    return value;
-                }
-
-                function absoluteUrl(base, link) {
-                    link = decodeRepeated(link);
-                    if (/^https?:\/\//i.test(link)) return link;
-                    if (/^\/\//.test(link)) return (base.indexOf('https://') === 0 ? 'https:' : 'http:') + link;
-
-                    var origin = (String(base || '').match(/^(https?:\/\/[^\/]+)/i) || [])[1] || '';
-                    if (link.charAt(0) === '/') return origin + link;
-
-                    var clean = String(base || '').replace(/[?#].*$/, '');
-                    var slash = clean.lastIndexOf('/');
-                    var dir = slash >= 0 ? clean.slice(0, slash + 1) : clean + '/';
-
-                    return dir + link;
-                }
-
-                function playlistDuration(text) {
-                    var total = 0;
-                    var match;
-                    var regex = /#EXTINF:([0-9.]+)/gi;
-
-                    while ((match = regex.exec(String(text || '')))) {
-                        total += parseFloat(match[1]) || 0;
-                    }
-
-                    return total;
-                }
-
-                function firstVariantUrl(text, base) {
-                    var lines = String(text || '').replace(/\r/g, '').split('\n');
-
-                    for (var i = 0; i < lines.length; i++) {
-                        if (lines[i].indexOf('#EXT-X-STREAM-INF') !== 0) continue;
-
-                        for (var j = i + 1; j < lines.length; j++) {
-                            var candidate = $.trim(lines[j] || '');
-                            if (!candidate) continue;
-                            if (candidate.charAt(0) === '#') continue;
-                            return absoluteUrl(base, candidate);
-                        }
-                    }
-
-                    return '';
-                }
-
-                function extractWidgetHls(html) {
-                    html = String(html || '');
-
-                    function valueAfter(marker) {
-                        var at = html.indexOf(marker);
-                        if (at < 0) return '';
-
-                        var start = html.indexOf('https://', at);
-                        if (start < 0) return '';
-
-                        var end = start;
-                        while (end < html.length) {
-                            var ch = html.charAt(end);
-                            if (ch === '"' || ch === "'" || ch === '<' || /\s/.test(ch)) break;
-                            if (ch === '%' && html.substr(end, 3).toLowerCase() === '%22') break;
-                            end++;
-                        }
-
-                        return decodeRepeated(html.slice(start, end));
-                    }
-
-                    var stream = valueAfter('streamUrl');
-                    if (/^https?:\/\/[^\s]+\.m3u8/i.test(stream)) return stream;
-
-                    var match = html.match(/[?&]mq_url=([^&"'<>\s]+)/i);
-                    if (match) {
-                        stream = decodeRepeated(match[1] || '');
-                        if (stream.indexOf('http') > 0) stream = stream.slice(stream.indexOf('http'));
-                        if (/^https?:\/\//i.test(stream)) return stream;
-                    }
-
-                    var generic = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
-                    return generic ? decodeRepeated(generic[0]) : '';
-                }
-
-                function requestText(url, callback) {
-                    metadataRequest.native(url, function (data) {
-                        callback(null, String(data || ''));
-                    }, function () {
-                        callback(new Error('request'));
-                    }, false, {
-                        dataType: 'text',
-                        timeout: 6000,
-                        headers: playbackHeaders('kinopoisk')
-                    });
-                }
-
-                function probeDuration() {
-                    var cache = window.capsule_trailer_kp_duration_cache = window.capsule_trailer_kp_duration_cache || {};
-                    var cacheKey = (String(streamUrl || '').match(/\/trailer\/(\d+)/i) || [])[1] || String(streamUrl || '').split('?')[0];
-
-                    if (cache[cacheKey] && applyDuration(cache[cacheKey])) return;
-
-                    requestText(streamUrl, function (error, html) {
-                        if (error || !html) return;
-
-                        var hls = extractWidgetHls(html);
-
-                        if (!hls) {
-                            var durationMatch = html.match(/["'](?:videoDuration|duration)["']\s*[:=]\s*["']?([0-9.]+)/i);
-                            if (durationMatch && applyDuration(durationMatch[1])) cache[cacheKey] = duration;
-                            return;
-                        }
-
-                        requestText(hls, function (playlistError, playlist) {
-                            if (playlistError || !playlist) return;
-
-                            var total = playlistDuration(playlist);
-
-                            if (total > 0) {
-                                if (applyDuration(total)) cache[cacheKey] = duration;
-                                return;
-                            }
-
-                            var variant = firstVariantUrl(playlist, hls);
-                            if (!variant) return;
-
-                            requestText(variant, function (variantError, mediaPlaylist) {
-                                if (variantError || !mediaPlaylist) return;
-
-                                var mediaDuration = playlistDuration(mediaPlaylist);
-                                if (mediaDuration > 0 && applyDuration(mediaDuration)) {
-                                    cache[cacheKey] = duration;
-                                }
-                            });
-                        });
-                    });
-                }
-
-                function post(method, data) {
-                    if (!frame || !frame.contentWindow) return;
-                    var message = data || {};
-                    message.method = method;
-                    try { frame.contentWindow.postMessage(message, '*'); } catch (e) {}
-                }
-
-                function parseMessage(event) {
-                    if (!frame || event.source !== frame.contentWindow) return null;
-                    if (event.origin && event.origin.indexOf('kinopoisk.ru') < 0 && event.origin.indexOf('yandex.ru') < 0) return null;
-                    var message = event.data;
-                    if (typeof message === 'string') {
-                        try { message = JSON.parse(message); } catch (e) { return null; }
-                    }
-                    return message && typeof message === 'object' ? message : null;
-                }
-
-                function sendEnded() {
-                    if (ended) return;
-                    ended = true;
-                    paused = true;
-                    stopClock();
-                    listener.send('ended');
-                }
-
-                function onMessage(event) {
-                    var message = parseMessage(event);
-                    if (!message) return;
-
-                    var payload = message;
-                    if (message.data && typeof message.data === 'object') payload = message.data;
-
-                    var detail = payload;
-                    if (payload && payload.data && typeof payload.data === 'object') detail = payload.data;
-
-                    function value(name) {
-                        if (detail && typeof detail[name] !== 'undefined') return detail[name];
-                        if (payload && typeof payload[name] !== 'undefined') return payload[name];
-                        return message[name];
-                    }
-
-                    var type = String(
-                        message.event || message.type ||
-                        (payload && (payload.event || payload.type)) ||
-                        (detail && (detail.event || detail.type)) || ''
-                    ).toLowerCase();
-
-                    var eventTime = value('time');
-                    var eventDuration = value('duration');
-
-                    if (typeof eventTime !== 'undefined' && isFinite(Number(eventTime))) {
-                        current = Math.max(0, Number(eventTime) || 0);
-                        lastRemoteClock = Date.now();
-                        clockBase = current;
-                        clockStamp = lastRemoteClock;
-                    }
-                    if (typeof eventDuration !== 'undefined' && Number(eventDuration) > 0) {
-                        applyDuration(eventDuration);
-                    }
-
-                    if (type === 'inited' || type === 'ready' || type === 'player:ready') {
-                        var firstReady = !ready;
-                        ready = true;
-                        clearTimeout(initTimer);
-                        setLoader(true);
-                        if (firstReady) {
-                            listener.send('canplay');
-                            listener.send('loadeddata');
-                        }
-                        post('setVolume', { volume: muted ? 0 : volume });
-                        if (wantedPlay) post('play');
-                        if (duration > 0) listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (type === 'started' || type === 'playing') {
-                        ready = true;
-                        clearTimeout(initTimer);
-                        ended = false;
-                        paused = false;
-                        hideLoader();
-                        startClock();
-                        listener.send('playing');
-                        listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (type === 'paused' || type === 'pause') {
-                        paused = true;
-                        stopClock();
-                        listener.send('pause');
-                        listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (type === 'ended' || type === 'finished') {
-                        hideLoader();
-                        sendEnded();
-                        return;
-                    }
-
-                    if (type === 'timeupdate' || type === 'progress') {
-                        if (current > 0 || duration > 0) hideLoader();
-                        listener.send('timeupdate');
-                        return;
-                    }
-
-                    if (type === 'bufferingstarted' || type === 'buffering') {
-                        setLoader(true);
-                        stopClock();
-                        listener.send('waiting');
-                        return;
-                    }
-
-                    if (type === 'bufferingended') {
-                        hideLoader();
-                        if (!paused) {
-                            startClock();
-                            listener.send('playing');
-                        }
-                        return;
-                    }
-
-                    if (type === 'error' || type === 'fatal') {
-                        hideLoader();
-                        paused = true;
-                        video.error = {
-                            code: value('code') || 'kinopoisk',
-                            message: value('message') || 'Kinopoisk widget playback error'
-                        };
-                        listener.send('error', { error: video.error, fatal: true });
-                    }
-                }
-
-                function createFrame() {
-                    if (frame) return;
-
-                    frame = document.createElement('iframe');
-                    frame.src = streamUrl;
-                    frame.setAttribute('frameborder', '0');
-                    frame.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
-                    frame.setAttribute('allowfullscreen', 'true');
-                    frame.style.width = '100%';
-                    frame.style.height = '100%';
-                    frame.style.border = '0';
-                    frame.style.display = 'block';
-                    frame.style.pointerEvents = 'none';
-
-                    frame.onload = function () {
-                        if (!frame) return;
-
-                        if (!ready) {
-                            ready = true;
-                            listener.send('canplay');
-                            listener.send('loadeddata');
-                        }
-
-                        setLoader(true);
-                        clearTimeout(loaderFallbackTimer);
-                        loaderFallbackTimer = setTimeout(function () {
-                            setLoader(true);
-                        }, 4500);
-
-                        post('setVolume', { volume: muted ? 0 : volume });
-
-                        if (wantedPlay) {
-                            paused = false;
-                            post('play');
-                            startClock();
-                            listener.send('playing');
-                        }
-                    };
-
-                    object.append(frame);
-
-                    initTimer = setTimeout(function () {
-                        if (ready || !frame) return;
-                        ready = true;
-                        listener.send('canplay');
-                        listener.send('loadeddata');
-
-                        if (wantedPlay) {
-                            paused = false;
-                            post('play');
-                            startClock();
-                            listener.send('playing');
-                        }
-                    }, 2500);
-                }
-
-                Object.defineProperty(video, 'src', {
-                    configurable: true,
-                    set: function (value) { streamUrl = String(value || ''); },
-                    get: function () { return streamUrl; }
-                });
-                Object.defineProperty(video, 'currentTime', {
-                    configurable: true,
-                    set: function (value) {
-                        current = Math.max(0, Number(value) || 0);
-                        if (duration > 0) current = Math.min(current, duration);
-                        lastRemoteClock = Date.now();
-                        clockBase = current;
-                        clockStamp = lastRemoteClock;
-                        post('seek', { time: current });
-                        listener.send('timeupdate');
-                        if (!paused && !ended) startClock();
-                    },
-                    get: function () { return current; }
-                });
-                Object.defineProperty(video, 'duration', {
-                    configurable: true,
-                    get: function () { return duration; }
-                });
-                Object.defineProperty(video, 'paused', {
-                    configurable: true,
-                    get: function () { return paused; }
-                });
-                Object.defineProperty(video, 'volume', {
-                    configurable: true,
-                    set: function (value) {
-                        volume = Math.max(0, Math.min(1, Number(value) || 0));
-                        if (ready) post('setVolume', { volume: muted ? 0 : volume });
-                    },
-                    get: function () { return volume; }
-                });
-                Object.defineProperty(video, 'muted', {
-                    configurable: true,
-                    set: function (value) {
-                        muted = !!value;
-                        if (ready) post('setVolume', { volume: muted ? 0 : volume });
-                    },
-                    get: function () { return muted; }
-                });
-                Object.defineProperty(video, 'videoWidth', {
-                    configurable: true,
-                    get: function () { return 1920; }
-                });
-                Object.defineProperty(video, 'videoHeight', {
-                    configurable: true,
-                    get: function () { return 1080; }
-                });
-                Object.defineProperty(video, 'audioTracks', { configurable: true, get: function () { return []; } });
-                Object.defineProperty(video, 'textTracks', { configurable: true, get: function () { return []; } });
-
-                video.canPlayType = function () { return true; };
-                video.addEventListener = listener.follow.bind(listener);
-                video.load = function () {
-                    if (!/^https?:\/\/widgets\.kinopoisk\.ru\//i.test(streamUrl)) {
-                        video.error = { code: 'kinopoisk-url', message: 'Invalid Kinopoisk widget URL' };
-                        listener.send('error', { error: video.error, fatal: true });
-                        return;
-                    }
-                    createFrame();
-                    probeDuration();
-                };
-                video.play = function () {
-                    wantedPlay = true;
-                    if (ready) {
-                        paused = false;
-                        post('play');
-                        startClock();
-                        listener.send('playing');
-                    }
-                };
-                video.pause = function () {
-                    wantedPlay = false;
-                    paused = true;
-                    stopClock();
-                    if (ready) post('pause');
-                };
-                video.resize = function () {};
-                video.size = function () {};
-                video.destroy = function () {
-                    clearTimeout(initTimer);
-                    clearTimeout(loaderFallbackTimer);
-                    stopClock();
-                    try { metadataRequest.clear(); } catch (e0) {}
-                    window.removeEventListener('message', onMessage);
-                    try { if (frame && frame.parentNode) frame.parentNode.removeChild(frame); } catch (e) {}
-                    frame = null;
-                    listener.destroy();
-                    object.remove();
-                };
-
-                window.addEventListener('message', onMessage);
-                callVideo(video);
-                return object;
-            }
-        };
-
-        if (Lampa.PlayerVideo.registerTube(registration)) {
-            window.capsule_trailer_kinopoisk_tube = registration;
-        }
-    }
-
     function registerPlaybackFallback() {
         if (window.capsule_trailer_playback_fallback) return;
         if (!Lampa.Player || !Lampa.Player.listener || !Lampa.PlayerVideo || !Lampa.PlayerVideo.listener) return;
@@ -2012,14 +1877,6 @@
                         return;
                     }
 
-                    if (data.capsule_source === 'kinopoisk-widget') {
-                        used = true;
-                        cleanup();
-                        Lampa.Noty.show('CAPSULE Trailer: Кинопоиск не смог запустить виджет');
-                        closePlayer();
-                        return;
-                    }
-
                     if (Lampa.Platform && Lampa.Platform.is && Lampa.Platform.is('android') && !data.capsule_native_retry) {
                         used = true;
                         var nativeData = {
@@ -2067,52 +1924,69 @@
         var style = document.createElement('style');
         style.id = 'capsule-trailer-style';
         style.textContent = '' +
-            '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box}' +
-            '.capsule-kinopoisk-player{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;background:#000;overflow:hidden}' +
-            '.capsule-kinopoisk-player iframe{position:absolute;top:0;right:0;bottom:0;left:0;width:100%;height:100%;border:0}' +
-            '.capsule-trailer{width:100%;box-sizing:border-box;color:inherit;padding-bottom:4em;background:#1b1c1e}' +
-            '.capsule-trailer__hero{position:relative;width:100%;height:20em;overflow:hidden;background:#1b1c1e}' +
-            '.capsule-trailer__backdrop{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 34%;opacity:.86;transform:scale(1.015)}' +
-            '.capsule-trailer__hero:before{content:"";position:absolute;z-index:1;inset:0;background:linear-gradient(90deg,rgba(27,28,30,.22) 0%,rgba(27,28,30,0) 48%,rgba(27,28,30,.08) 100%)}' +
-            '.capsule-trailer__hero:after{content:"";position:absolute;z-index:1;left:0;right:0;top:28%;bottom:-1px;background:linear-gradient(180deg,rgba(27,28,30,0) 0%,rgba(27,28,30,.16) 26%,rgba(27,28,30,.62) 66%,#1b1c1e 100%)}' +
-            '.capsule-trailer__hero-info{position:absolute;z-index:2;left:2.2em;right:2.2em;bottom:1.15em;max-width:73em;margin:0 auto}' +
-            '.capsule-trailer__title{font-size:1.95em;font-weight:600;line-height:1.08;letter-spacing:-.015em;text-shadow:0 .05em .28em rgba(0,0,0,.5)}' +
-            '.capsule-trailer__sub{font-size:.92em;opacity:.62;margin-top:.48em}' +
-            '.capsule-trailer__summary{display:flex;align-items:center;justify-content:space-between;max-width:76em;margin:0 auto;padding:.72em 2.2em .5em;box-sizing:border-box}' +
-            '.capsule-trailer__status{font-size:.94em;opacity:.6;min-width:0}' +
-            '.capsule-trailer__sort{font-size:.84em;opacity:.35;margin-left:1em;white-space:nowrap}' +
-            '.capsule-trailer__results{max-width:76em;margin:0 auto;padding:0 2.2em 6em;box-sizing:border-box}' +
-            '.capsule-trailer__item{display:flex;align-items:center;position:relative;padding:.72em .35em;margin:0;border-radius:.65em;transition:background-color .12s ease,transform .12s ease;box-sizing:border-box}' +
-            '.capsule-trailer__item:after{content:"";position:absolute;left:11.5em;right:.35em;bottom:0;height:1px;background:rgba(255,255,255,.055)}' +
-            '.capsule-trailer__item:last-child:after{display:none}' +
-            '.capsule-trailer__item--best{background:transparent}' +
-            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.095)}' +
-            '.capsule-trailer__item.focus{transform:scale(1.006)}' +
-            '.capsule-trailer__thumb{width:10.15em;height:5.7em;object-fit:cover;border-radius:.72em;background:rgba(255,255,255,.055);flex:0 0 auto;margin-right:1em}' +
-            '.capsule-trailer__thumb--empty{display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.7)}' +
-            '.capsule-trailer__thumb--empty svg{width:3em;height:3em;opacity:.72}' +
-            '.capsule-trailer__meta{min-width:0;flex:1;padding-right:.3em}' +
-            '.capsule-trailer__name{font-size:1.02em;font-weight:500;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
-            '.capsule-trailer__line{font-size:.82em;opacity:.52;margin-top:.34em;line-height:1.35}' +
-            '.capsule-trailer__empty{padding:1.7em .35em;opacity:.62;font-size:1em}' +
-            '.capsule-trailer__retry{display:inline-flex;align-items:center;padding:.68em 1em;border-radius:.65em;background:rgba(255,255,255,.095);margin-top:.8em}' +
-            '.view--capsule-trailer svg{width:1.55em;height:1.55em}' +
+            '.capsule-trailer-scroll{width:100%;height:100%;box-sizing:border-box;background:#151618}' +
+            '.capsule-trailer{width:100%;min-height:100%;box-sizing:border-box;color:inherit;background:#151618;padding-bottom:3em}' +
+            '.capsule-trailer__hero{position:relative;width:100%;height:21em;overflow:hidden;background:#151618}' +
+            '.capsule-trailer__backdrop{position:absolute;inset:-1.5%;width:103%;height:103%;object-fit:cover;object-position:center 38%;opacity:.82;filter:saturate(.9) contrast(1.03)}' +
+            '.capsule-trailer__hero:before{content:"";position:absolute;z-index:1;inset:0;background:linear-gradient(90deg,rgba(21,22,24,.58) 0%,rgba(21,22,24,.13) 46%,rgba(21,22,24,.08) 100%)}' +
+            '.capsule-trailer__hero:after{content:"";position:absolute;z-index:1;left:0;right:0;top:30%;bottom:-1px;background:linear-gradient(180deg,rgba(21,22,24,0) 0%,rgba(21,22,24,.08) 25%,rgba(21,22,24,.72) 72%,#151618 100%)}' +
+            '.capsule-trailer__hero-inner{position:absolute;z-index:2;left:2.4em;right:2.4em;bottom:2.15em;max-width:74em;margin:0 auto}' +
+            '.capsule-trailer__eyebrow{display:flex;align-items:center;gap:.52em;font-size:.68em;font-weight:600;letter-spacing:.16em;text-transform:uppercase;opacity:.62;margin-bottom:.78em}' +
+            '.capsule-trailer__eyebrow svg{width:1.55em;height:1.55em;flex:0 0 auto}' +
+            '.capsule-trailer__title{font-size:2.18em;font-weight:590;line-height:1.05;letter-spacing:-.025em;max-width:18em;text-shadow:0 .08em .34em rgba(0,0,0,.42)}' +
+            '.capsule-trailer__hero-meta{display:flex;gap:.65em;align-items:center;font-size:.86em;opacity:.62;margin-top:.68em}' +
+            '.capsule-trailer__hero-meta span+span:before{content:"•";margin-right:.65em;opacity:.55}' +
+            '.capsule-trailer__panel{position:relative;z-index:3;max-width:78em;margin:-1.05em auto 0;background:#191a1c;border-radius:1.25em 1.25em 0 0;box-shadow:0 -1.2em 3em rgba(0,0,0,.08);min-height:17em;padding-top:.25em}' +
+            '.capsule-trailer__summary{display:flex;align-items:center;justify-content:space-between;padding:1.05em 1.45em .75em;box-sizing:border-box}' +
+            '.capsule-trailer__status{font-size:.92em;font-weight:500;opacity:.66;min-width:0}' +
+            '.capsule-trailer__sort{font-size:.78em;letter-spacing:.015em;opacity:.34;margin-left:1em;white-space:nowrap}' +
+            '.capsule-trailer__results{padding:0 .72em 6em;box-sizing:border-box}' +
+            '.capsule-trailer__item{display:flex;align-items:center;position:relative;min-height:6.8em;padding:.7em .72em;border-radius:.9em;box-sizing:border-box;transition:background-color .12s ease,transform .12s ease}' +
+            '.capsule-trailer__item+.capsule-trailer__item:before{content:"";position:absolute;left:11.45em;right:.72em;top:0;height:1px;background:rgba(255,255,255,.045)}' +
+            '.capsule-trailer__item.focus,.capsule-trailer__item:hover{background:rgba(255,255,255,.082)}' +
+            '.capsule-trailer__item.focus{transform:scale(1.004)}' +
+            '.capsule-trailer__thumb{width:9.65em;height:5.43em;object-fit:cover;border-radius:.78em;background:#232427;flex:0 0 auto;margin-right:1.08em}' +
+            '.capsule-trailer__thumb--empty{display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.62)}' +
+            '.capsule-trailer__thumb--empty svg{width:2.7em;height:2.7em}' +
+            '.capsule-trailer__meta{min-width:0;flex:1}' +
+            '.capsule-trailer__topline{display:flex;align-items:flex-start;gap:.85em;min-width:0}' +
+            '.capsule-trailer__name{font-size:1.02em;font-weight:500;line-height:1.3;flex:1;min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}' +
+            '.capsule-trailer__source{flex:0 0 auto;font-size:.66em;font-weight:650;letter-spacing:.055em;text-transform:uppercase;opacity:.48;padding:.34em .52em;border:1px solid rgba(255,255,255,.13);border-radius:.55em;margin-top:.05em}' +
+            '.capsule-trailer__item--best .capsule-trailer__source{opacity:.68;border-color:rgba(255,255,255,.22)}' +
+            '.capsule-trailer__line{font-size:.81em;opacity:.48;margin-top:.38em;line-height:1.35}' +
+            '.capsule-trailer__empty{padding:2.8em 1em 1.8em;text-align:center;opacity:.52;font-size:.95em}' +
+            '.capsule-trailer__retry{display:flex;width:max-content;margin:1em auto 0;padding:.68em 1em;border-radius:.7em;background:rgba(255,255,255,.085)}' +
+            '.capsule-trailer__loading{padding:.15em .72em 1.2em}' +
+            '.capsule-trailer__loading.hide{display:none}' +
+            '.capsule-trailer__skeleton{display:flex;align-items:center;min-height:6.8em;padding:.7em .72em;box-sizing:border-box}' +
+            '.capsule-trailer__skeleton-thumb{width:9.65em;height:5.43em;border-radius:.78em;background:rgba(255,255,255,.055);flex:0 0 auto;margin-right:1.08em}' +
+            '.capsule-trailer__skeleton-copy{flex:1}' +
+            '.capsule-trailer__skeleton-line{height:.72em;border-radius:.5em;background:rgba(255,255,255,.055);width:58%;margin:.5em 0}' +
+            '.capsule-trailer__skeleton-line.small{width:36%;opacity:.72}' +
+            '.view--capsule-trailer svg{width:1.58em;height:1.58em}' +
             'body.true--mobile:not(.orientation--landscape) .capsule-trailer__results{padding-bottom:14em}' +
             'body.true--mobile.orientation--landscape .capsule-trailer__results{padding-right:12em}' +
             '@media(max-width:700px){' +
-                '.capsule-trailer__hero{height:15.2em}' +
-                '.capsule-trailer__hero-info{left:1.25em;right:1.25em;bottom:.85em}' +
-                '.capsule-trailer__title{font-size:1.55em}' +
-                '.capsule-trailer__sub{font-size:.86em;margin-top:.38em}' +
-                '.capsule-trailer__summary{padding:.62em 1.25em .38em}' +
-                '.capsule-trailer__results{padding:0 1.05em 5em}' +
-                '.capsule-trailer__item{padding:.62em .2em}' +
-                '.capsule-trailer__item:after{left:7.9em;right:.2em}' +
-                '.capsule-trailer__thumb{width:7em;height:3.94em;margin-right:.7em;border-radius:.58em}' +
-                '.capsule-trailer__thumb--empty svg{width:2.35em;height:2.35em}' +
-                '.capsule-trailer__name{font-size:.95em}' +
-                '.capsule-trailer__line{font-size:.77em;margin-top:.28em}' +
+                '.capsule-trailer__hero{height:14.4em}' +
+                '.capsule-trailer__hero-inner{left:1.18em;right:1.18em;bottom:1.55em}' +
+                '.capsule-trailer__eyebrow{font-size:.6em;margin-bottom:.62em}' +
+                '.capsule-trailer__title{font-size:1.58em;max-width:14em}' +
+                '.capsule-trailer__hero-meta{font-size:.79em;margin-top:.5em}' +
+                '.capsule-trailer__panel{margin-top:-.75em;border-radius:1em 1em 0 0;padding-top:.15em}' +
+                '.capsule-trailer__summary{padding:.86em 1.16em .55em}' +
+                '.capsule-trailer__status{font-size:.88em}' +
                 '.capsule-trailer__sort{display:none}' +
+                '.capsule-trailer__results{padding:0 .55em 5em}' +
+                '.capsule-trailer__item{min-height:5.55em;padding:.58em .58em;border-radius:.78em}' +
+                '.capsule-trailer__item+.capsule-trailer__item:before{left:7.85em;right:.58em}' +
+                '.capsule-trailer__thumb{width:6.55em;height:3.69em;border-radius:.62em;margin-right:.78em}' +
+                '.capsule-trailer__thumb--empty svg{width:2.1em;height:2.1em}' +
+                '.capsule-trailer__name{font-size:.92em;line-height:1.28}' +
+                '.capsule-trailer__source{font-size:.57em;padding:.3em .42em;border-radius:.48em}' +
+                '.capsule-trailer__line{font-size:.73em;margin-top:.26em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+                '.capsule-trailer__loading{padding:0 .55em 1em}' +
+                '.capsule-trailer__skeleton{min-height:5.55em;padding:.58em}' +
+                '.capsule-trailer__skeleton-thumb{width:6.55em;height:3.69em;border-radius:.62em;margin-right:.78em}' +
             '}';
         document.head.appendChild(style);
     }
@@ -2146,6 +2020,14 @@
         html.addClass('capsule-trailer-scroll');
         var status = $('<div class="capsule-trailer__status"></div>');
         var summary = $('<div class="capsule-trailer__summary"></div>');
+        var panel = $('<div class="capsule-trailer__panel"></div>');
+        var loading = $('' +
+            '<div class="capsule-trailer__loading">' +
+                '<div class="capsule-trailer__skeleton"><div class="capsule-trailer__skeleton-thumb"></div><div class="capsule-trailer__skeleton-copy"><div class="capsule-trailer__skeleton-line"></div><div class="capsule-trailer__skeleton-line small"></div></div></div>' +
+                '<div class="capsule-trailer__skeleton"><div class="capsule-trailer__skeleton-thumb"></div><div class="capsule-trailer__skeleton-copy"><div class="capsule-trailer__skeleton-line"></div><div class="capsule-trailer__skeleton-line small"></div></div></div>' +
+                '<div class="capsule-trailer__skeleton"><div class="capsule-trailer__skeleton-thumb"></div><div class="capsule-trailer__skeleton-copy"><div class="capsule-trailer__skeleton-line"></div><div class="capsule-trailer__skeleton-line small"></div></div></div>' +
+            '</div>'
+        );
         var resultRoot = $('<div class="capsule-trailer__results"></div>');
         var alive = true;
         var started = false;
@@ -2165,13 +2047,18 @@
             var backdrop = backdropUrl(movie);
             var title = movie.title || movie.name || movie.original_title || movie.original_name || 'Трейлеры';
             var year = yearOf(movie);
+            var type = mediaType(movie) === 'tv' ? 'Сериал' : 'Фильм';
             var image = backdrop ? '<img class="capsule-trailer__backdrop" src="' + escapeHtml(backdrop) + '" />' : '';
             return $(
                 '<div class="capsule-trailer__hero">' +
                     image +
-                    '<div class="capsule-trailer__hero-info">' +
+                    '<div class="capsule-trailer__hero-inner">' +
+                        '<div class="capsule-trailer__eyebrow">' + ICON + '<span>CAPSULE TRAILER</span></div>' +
                         '<div class="capsule-trailer__title">' + escapeHtml(title) + '</div>' +
-                        '<div class="capsule-trailer__sub">' + escapeHtml(year ? year + ' · CAPSULE Trailer' : 'CAPSULE Trailer') + '</div>' +
+                        '<div class="capsule-trailer__hero-meta">' +
+                            (year ? '<span>' + escapeHtml(year) + '</span>' : '') +
+                            '<span>' + type + '</span>' +
+                        '</div>' +
                     '</div>' +
                 '</div>'
             );
@@ -2195,7 +2082,7 @@
             return lang ? lang.toUpperCase() : '';
         }
 
-            function itemMeta(item, provider) {
+            function itemMeta(item) {
             var parts = [];
             var kind = item.kind || trailerKind(item.title);
             if (kind === 'teaser') parts.push('Тизер');
@@ -2204,15 +2091,17 @@
             if (lang) parts.push(lang);
             if (item.qualityHint) parts.push(item.qualityHint);
             if (item.duration) parts.push(secondsText(item.duration));
-
-            var source = item.providerName || (provider && provider.name) || '';
-            if (source) parts.push('Источник: ' + source);
-
             return parts;
         }
 
+        function sourceLabel(item, provider) {
+            var value = item.providerName || (provider && provider.name) || '';
+            return String(value || '').replace(/^OK$/i, 'OK.ru');
+        }
+
         function makeItem(item, provider) {
-            var meta = itemMeta(item, provider);
+            var meta = itemMeta(item);
+            var source = sourceLabel(item, provider);
             var thumb = item.thumbnail ?
                 '<img class="capsule-trailer__thumb" src="' + escapeHtml(item.thumbnail) + '" />' :
                 '<div class="capsule-trailer__thumb capsule-trailer__thumb--empty">' + ICON + '</div>';
@@ -2220,7 +2109,10 @@
                 '<div class="capsule-trailer__item selector" data-score="' + escapeHtml(item.score || 0) + '">' +
                     thumb +
                     '<div class="capsule-trailer__meta">' +
-                        '<div class="capsule-trailer__name">' + escapeHtml(item.title) + '</div>' +
+                        '<div class="capsule-trailer__topline">' +
+                            '<div class="capsule-trailer__name">' + escapeHtml(item.title) + '</div>' +
+                            (source ? '<div class="capsule-trailer__source">' + escapeHtml(source) + '</div>' : '') +
+                        '</div>' +
                         '<div class="capsule-trailer__line">' + escapeHtml(meta.join(' · ')) + '</div>' +
                     '</div>' +
                 '</div>'
@@ -2244,6 +2136,7 @@
 
         function appendResults(provider, items) {
             if (!alive || !items || !items.length) return;
+            loading.addClass('hide');
             for (var i = 0; i < items.length; i++) {
                 var item = items[i];
                 item.score = scoreCandidate(item, movie, item.exactMovieMatch === true);
@@ -2302,7 +2195,7 @@
             appendResults(provider, items || []);
             pendingProviders--;
             if (pendingProviders <= 0) searchFinished();
-            else if (totalResults) status.text('Найдено: ' + totalResults + ' · поиск продолжается…');
+            else if (totalResults) status.text(totalResults + ' ' + (totalResults === 1 ? 'вариант' : (totalResults < 5 ? 'варианта' : 'вариантов')));
         }
 
         function runProviders() {
@@ -2346,13 +2239,13 @@
             autoTimer = null;
             last = null;
             resultRoot.empty();
+            loading.removeClass('hide');
         }
 
         function retry() {
             cacheDropMovie(movie);
             clearSearchState();
-            status.text('Ищем трейлеры…');
-            self.activity.loader(true);
+            status.text('Ищем лучшие варианты…');
             runProviders();
         }
 
@@ -2369,6 +2262,7 @@
 
         function searchFinished() {
             if (!alive) return;
+            loading.addClass('hide');
             self.activity.loader(false);
             sortResults();
             if (totalResults) {
@@ -2419,13 +2313,14 @@
         this.create = function () {
             content.append(header());
             summary.append(status);
-            summary.append('<div class="capsule-trailer__sort">Лучшие совпадения</div>');
-            content.append(summary);
-            content.append(resultRoot);
+            summary.append('<div class="capsule-trailer__sort">По релевантности</div>');
+            panel.append(summary);
+            panel.append(loading);
+            panel.append(resultRoot);
+            content.append(panel);
             scroll.append(content);
             try { scroll.height(); } catch (e) {}
-            status.text('Ищем трейлеры…');
-            this.activity.loader(true);
+            status.text('Ищем лучшие варианты…');
             runProviders();
             return this.render();
         };
@@ -2507,7 +2402,7 @@
             },
             field: {
                 name: 'Автоматически запускать лучший трейлер',
-                description: 'CAPSULE сначала завершает быстрый поиск, сравнивает результаты по score и запускает лучший без открытия списка. Экспериментальный Кинопоиск в автостарт не участвует.'
+                description: 'Сравнивает проверенные результаты и запускает лучший без открытия списка. Экспериментальные источники пока не участвуют в автостарте.'
             }
         });
 
@@ -2520,7 +2415,7 @@
             },
             field: {
                 name: 'Заменить стандартные трейлеры Lampa',
-                description: 'Убирает штатную кнопку трейлеров Lampa из карточки и оставляет только CAPSULE Trailer.'
+                description: 'Скрывает штатную кнопку трейлеров Lampa и оставляет CAPSULE Trailer.'
             }
         });
 
@@ -2541,7 +2436,7 @@
             },
             field: {
                 name: 'Приоритет качества',
-                description: 'CAPSULE сначала выбирает ближайшее к этому качеству. «Лучшее доступное» предпочитает максимальное качество.'
+                description: 'Выбирает ближайший подходящий поток. «Лучшее доступное» предпочитает максимальное качество.'
             }
         });
 
@@ -2556,7 +2451,7 @@
             param: { type: 'static' },
             field: {
                 name: 'OK.ru — основной источник',
-                description: 'Всегда включён. На нём строится основной быстрый поиск CAPSULE Trailer; отключить его нельзя.'
+                description: 'Всегда включён. Быстрый анонимный поиск и прямые потоки без пользовательского ключа.'
             },
             onRender: function (item) {
                 item.removeClass('selector');
@@ -2572,37 +2467,35 @@
             },
             field: {
                 name: 'Прямые трейлеры Lampa',
-                description: 'Использовать уже полученные Lampa прямые MP4/HLS/DASH ссылки, если они есть.'
+                description: 'Использовать уже известные Lampa прямые MP4/HLS/DASH ссылки, если они есть.'
             }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'capsule_trailer_settings',
             param: {
-                name: 'capsule_trailer_kinopoisk',
+                name: 'capsule_trailer_vk',
                 type: 'trigger',
                 default: true
             },
             field: {
-                name: 'Кинопоиск · экспериментально',
-                description: 'Поиск идёт через Kinopoisk API Unofficial, а воспроизведение — через сам Kinopoisk widget внутри плеера Lampa. Виджет может зависеть от региона.'
+                name: 'VK Video · экспериментально',
+                description: 'Анонимный публичный поиск VK Video без аккаунта и пользовательского ключа. Изолирован от основного источника.'
             }
         });
 
         Lampa.SettingsApi.addParam({
             component: 'capsule_trailer_settings',
             param: {
-                name: 'capsule_trailer_kinopoisk_key',
-                type: 'input',
-                values: '',
-                default: ''
+                name: 'capsule_trailer_dzen',
+                type: 'trigger',
+                default: true
             },
             field: {
-                name: 'Kinopoisk unofficial API key',
-                description: 'Ключ хранится в Storage Lampa и отправляется только kinopoiskapiunofficial.tech через X-API-KEY.'
+                name: 'Дзен · экспериментально',
+                description: 'Публичный поиск видео Дзен без пользовательского ключа. Изолирован от OK.ru и не влияет на автостарт.'
             }
         });
-
     }
 
     function addCardButton(event) {
@@ -2671,7 +2564,6 @@
         addStyles();
         setupSettings();
         registerCapsuleMediaTube();
-        registerKinopoiskTube();
         registerPlaybackFallback();
         if (!Lampa.Component.get(COMPONENT)) Lampa.Component.add(COMPONENT, TrailerComponent);
         Lampa.Listener.follow('full', addCardButton);
