@@ -11,9 +11,8 @@
  * - Lampa.Player / Lampa.PlayerVideo.registerTube
  *
  * Discovery / playback layers:
- * - Direct trailer URLs already present in Lampa movie metadata.
  * - OK.ru is the primary trailer source.
- * - VK Video and Dzen are isolated anonymous experimental providers.
+ * - VK Video and Dzen are additional trailer sources.
  *
  */
 (function () {
@@ -22,10 +21,10 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.8.0';
+    var VERSION = '3.9.0';
     var COMPONENT = 'capsule_trailer';
     var NAV_CONTROLLER = 'content';
-    var CACHE_KEY = 'capsule_trailer_cache_v14';
+    var CACHE_KEY = 'capsule_trailer_cache_v15';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
     var SEARCH_TIMEOUT = 8000;
@@ -635,68 +634,6 @@
         return data;
     }
 
-    function normalizeNativeVideos(videos, movie) {
-        var out = [];
-        if (!settingEnabled('capsule_trailer_direct', true)) return out;
-
-        var list = videos && videos.results ? videos.results : [];
-        for (var i = 0; i < list.length; i++) {
-            var raw = list[i] || {};
-            var rawSite = String(raw.site || '').toUpperCase();
-            var rawUrl = String(raw.url || '');
-            if (rawSite === 'YOUTUBE' || /(?:youtube\.com|youtu\.be|googlevideo\.com)/i.test(rawUrl)) continue;
-            if (!directMediaUrl(rawUrl)) continue;
-
-            var item = {
-                id: 'direct:' + raw.url,
-                canonical: 'direct:' + raw.url,
-                provider: 'direct',
-                providerName: 'Lampa',
-                title: raw.name || 'Трейлер',
-                description: '',
-                duration: 0,
-                thumbnail: raw.icon || '',
-                author: '',
-                language: raw.iso_639_1 || '',
-                qualityHint: raw.size ? String(raw.size) + 'p' : '',
-                year: yearOf(movie),
-                kind: String(raw.type || '').toLowerCase() === 'teaser' ? 'teaser' : 'trailer',
-                official: raw.official === true,
-                url: raw.url,
-                transportScore: 145,
-                exactMovieMatch: true
-            };
-            item.score = scoreCandidate(item, movie, true);
-            out.push(item);
-        }
-
-        out.sort(function (a, b) { return b.score - a.score; });
-        return out;
-    }
-
-    var NativeDirectProvider = {
-        id: 'direct',
-        name: 'Lampa direct',
-        tier: 'stable',
-        autoplay: true,
-        search: function (context, done) {
-            done(null, normalizeNativeVideos(context.videos, context.movie));
-            return function () {};
-        },
-        resolve: function (item, context, done) {
-            var data = {
-                url: item.url,
-                title: item.title,
-                card: context.movie,
-                capsule_trailer: true,
-                capsule_source: 'direct'
-            };
-            if (/\.m3u8(?:[?#]|$)/i.test(item.url)) data.hls_type = 'native';
-            done(null, data);
-            return function () {};
-        }
-    };
-
     function decodeHtmlEntities(value) {
         value = String(value || '');
         if (value.indexOf('&') < 0) return value;
@@ -934,7 +871,7 @@
     var OkProvider = {
         id: 'ok',
         name: 'OK',
-        tier: 'experimental',
+        tier: 'stable',
         autoplay: true,
         search: function (context, done) {
             var movie = context.movie || {};
@@ -1308,7 +1245,7 @@
     var DzenProvider = {
         id: 'dzen',
         name: 'Дзен',
-        tier: 'experimental',
+        tier: 'stable',
         autoplay: true,
         search: function (context, done) {
             if (!settingEnabled('capsule_trailer_dzen', true)) {
@@ -1574,7 +1511,7 @@
     var VkProvider = {
         id: 'vk',
         name: 'VK Video',
-        tier: 'experimental',
+        tier: 'stable',
         autoplay: true,
         search: function (context, done) {
             if (!settingEnabled('capsule_trailer_vk', true)) {
@@ -1616,7 +1553,7 @@
         resolve: resolveVk
     };
 
-    var PROVIDERS = [NativeDirectProvider, OkProvider, VkProvider, DzenProvider];
+    var PROVIDERS = [OkProvider, VkProvider, DzenProvider];
 
     function closeSourceSelectionState() {
         try {
@@ -1898,7 +1835,7 @@
 
                             setTimeout(function () {
                                 try { Lampa.Player.play(fallbackData); }
-                                catch (e2) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
+                                catch (e2) { Lampa.Noty.show('Видео недоступно'); }
                             }, 100);
                         }, 0);
                         return;
@@ -1928,7 +1865,7 @@
 
                             setTimeout(function () {
                                 try { Lampa.Player.play(nativeData); }
-                                catch (e4) { Lampa.Noty.show('CAPSULE Trailer: видео недоступно'); }
+                                catch (e4) { Lampa.Noty.show('Видео недоступно'); }
                             }, 120);
                         }, 0);
                         return;
@@ -1936,7 +1873,7 @@
 
                     used = true;
                     cleanup();
-                    Lampa.Noty.show('CAPSULE Trailer: этот поток недоступен, выберите другой вариант');
+                    Lampa.Noty.show('Этот вариант недоступен — выберите другой');
                     closePlayer();
                 }, 80);
             }
@@ -2147,7 +2084,7 @@
         function languageLabel(item) {
             var lang = inferLanguage(item).toLowerCase();
             if (lang === 'ru' || lang === 'rus') return 'Русский';
-            if (lang === 'en' || lang === 'eng') return 'English';
+            if (lang === 'en' || lang === 'eng') return 'Английский';
             return lang ? lang.toUpperCase() : '';
         }
 
@@ -2204,7 +2141,6 @@
             if (id === 'ok') return 'OK';
             if (id === 'vk') return 'VK';
             if (id === 'dzen') return 'Дзен';
-            if (id === 'direct') return 'Lampa';
             return id;
         }
 
@@ -2261,7 +2197,7 @@
                 if (provider) available[provider] = true;
             });
 
-            var order = ['ok', 'vk', 'dzen', 'direct'];
+            var order = ['ok', 'vk', 'dzen'];
             availableFilters = [];
 
             for (var i = 0; i < order.length; i++) {
@@ -2493,7 +2429,7 @@
                 if (!alive) return;
                 self.activity.loader(false);
                 if (error || !data || !data.url) {
-                    Lampa.Noty.show('CAPSULE Trailer: видео недоступно');
+                    Lampa.Noty.show('Видео недоступно');
                     return;
                 }
                 try {
@@ -2501,7 +2437,7 @@
                 }
                 catch (e) {
                     log('Player.play error', e);
-                    Lampa.Noty.show('CAPSULE Trailer: ошибка запуска видео');
+                    Lampa.Noty.show('Не удалось запустить видео');
                 }
             });
             resolvingCancel = settled ? null : (typeof cancelResolve === 'function' ? cancelResolve : null);
@@ -2609,8 +2545,8 @@
                 default: false
             },
             field: {
-                name: 'Автоматически запускать лучший трейлер',
-                description: 'Сравнивает OK.ru, VK Video, Дзен и прямые варианты Lampa по совпадению названия, качеству и другим признакам, затем запускает лучший без открытия списка.'
+                name: 'Сразу запускать лучший трейлер',
+                description: 'Выбирает наиболее подходящий трейлер по названию, году, языку и качеству и запускает его сразу.'
             }
         });
 
@@ -2623,7 +2559,7 @@
             },
             field: {
                 name: 'Заменить стандартные трейлеры Lampa',
-                description: 'Скрывает штатную кнопку трейлеров Lampa и оставляет CAPSULE Trailer.'
+                description: 'Скрывает стандартную кнопку трейлеров и оставляет только CAPSULE Trailer.'
             }
         });
 
@@ -2643,8 +2579,8 @@
                 default: 'best'
             },
             field: {
-                name: 'Приоритет качества',
-                description: 'Выбирает ближайший подходящий поток. «Лучшее доступное» предпочитает максимальное качество.'
+                name: 'Предпочитаемое качество',
+                description: 'Какое качество предпочитать при запуске. Если такого варианта нет, будет выбрано ближайшее доступное.'
             }
         });
 
@@ -2659,23 +2595,10 @@
             param: { type: 'static' },
             field: {
                 name: 'OK.ru — основной источник',
-                description: 'Всегда включён. Быстрый анонимный поиск и прямые потоки без пользовательского ключа.'
+                description: 'Основной источник CAPSULE Trailer. Всегда включён.'
             },
             onRender: function (item) {
                 item.removeClass('selector');
-            }
-        });
-
-        Lampa.SettingsApi.addParam({
-            component: 'capsule_trailer_settings',
-            param: {
-                name: 'capsule_trailer_direct',
-                type: 'trigger',
-                default: true
-            },
-            field: {
-                name: 'Прямые трейлеры Lampa',
-                description: 'Использовать уже известные Lampa прямые MP4/HLS/DASH ссылки, если они есть.'
             }
         });
 
@@ -2687,8 +2610,8 @@
                 default: true
             },
             field: {
-                name: 'VK Video · экспериментально',
-                description: 'Анонимный публичный поиск VK Video без аккаунта и пользовательского ключа. Участвует в выборе лучшего трейлера.'
+                name: 'VK Video',
+                description: 'Использовать трейлеры из VK Video. Участвует в автоматическом выборе лучшего варианта.'
             }
         });
 
@@ -2700,8 +2623,8 @@
                 default: true
             },
             field: {
-                name: 'Дзен · экспериментально',
-                description: 'Публичный поиск видео Дзен без пользовательского ключа. Участвует в выборе лучшего трейлера.'
+                name: 'Дзен',
+                description: 'Использовать трейлеры из Дзена. Участвует в автоматическом выборе лучшего варианта.'
             }
         });
     }
