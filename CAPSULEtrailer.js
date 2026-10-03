@@ -22,8 +22,9 @@
     if (window.capsule_trailer_ready) return;
     window.capsule_trailer_ready = true;
 
-    var VERSION = '3.7.0';
+    var VERSION = '3.8.0';
     var COMPONENT = 'capsule_trailer';
+    var NAV_CONTROLLER = 'content';
     var CACHE_KEY = 'capsule_trailer_cache_v14';
     var CACHE_TTL = 1000 * 60 * 60 * 6;
     var CACHE_MAX = 40;
@@ -2105,14 +2106,41 @@
             );
         }
 
+        function ensureVisible(item) {
+            if (!item || !item.length) return;
+
+            try {
+                var node = item[0];
+                var viewport = scroll.render(true);
+                if (!node || !viewport || !node.getBoundingClientRect || !viewport.getBoundingClientRect) return;
+
+                var rect = node.getBoundingClientRect();
+                var box = viewport.getBoundingClientRect();
+                var margin = 18;
+
+                if (rect.bottom > box.bottom - margin) {
+                    scroll.shift(rect.bottom - (box.bottom - margin));
+                }
+                else if (rect.top < box.top + margin) {
+                    scroll.shift(rect.top - (box.top + margin));
+                }
+            }
+            catch (e) {}
+        }
+
         function refreshCollection(item) {
             if (!started || !Lampa.Activity.own(self)) return;
             var enabled = Lampa.Controller.enabled();
-            if (!enabled || enabled.name !== COMPONENT) return;
+            if (!enabled || enabled.name !== NAV_CONTROLLER) return;
             if (item) Lampa.Controller.collectionAppend(item);
+
             if (!last) {
-                var first = scroll.render().find('.selector').first();
-                if (first.length) Lampa.Controller.collectionFocus(first, scroll.render());
+                try { scroll.reset(); } catch (e) {}
+                var first = scroll.render().find('.selector').filter(function () {
+                    return !$(this).hasClass('hide') && this.offsetParent !== null;
+                }).first();
+
+                if (first.length) Lampa.Controller.collectionFocus(first, scroll.render(), true);
             }
         }
 
@@ -2161,7 +2189,7 @@
 
             el.on('hover:focus', function () {
                 last = el;
-                try { scroll.update(el, true); } catch (e) {}
+                ensureVisible(el);
             });
 
             el.on('hover:enter', function () {
@@ -2266,10 +2294,10 @@
                 onSelect: function (item) {
                     applySourceFilter(item && item.filter || 'all', true);
                     try { Lampa.Activity.mixState(); } catch (e) {}
-                    try { Lampa.Controller.toggle(COMPONENT); } catch (e2) {}
+                    try { Lampa.Controller.toggle(NAV_CONTROLLER); } catch (e2) {}
                 },
                 onBack: function () {
-                    try { Lampa.Controller.toggle(COMPONENT); } catch (e) {}
+                    try { Lampa.Controller.toggle(NAV_CONTROLLER); } catch (e) {}
                 }
             });
         }
@@ -2333,9 +2361,12 @@
 
             if (started && Lampa.Activity.own(self)) {
                 var enabled = Lampa.Controller.enabled();
-                if (enabled && enabled.name === COMPONENT) {
-                    Lampa.Controller.collectionSet(scroll.render());
-                    Lampa.Controller.collectionFocus(last || false, scroll.render());
+                if (enabled && enabled.name === NAV_CONTROLLER) {
+                    Lampa.Controller.collectionSet(scroll.render(), false, true);
+
+                    if (last && last.length && last[0] && last[0].offsetParent !== null) {
+                        Lampa.Controller.collectionFocus(last, scroll.render(), true);
+                    }
                 }
             }
         }
@@ -2494,20 +2525,30 @@
         this.start = function () {
             if (!Lampa.Activity.own(this)) return;
             started = true;
-            try { scroll.restorePosition(); } catch (e) {}
-            Lampa.Controller.add(COMPONENT, {
+
+            Lampa.Controller.add(NAV_CONTROLLER, {
                 toggle: function () {
-                    Lampa.Controller.collectionSet(scroll.render());
-                    Lampa.Controller.collectionFocus(last || false, scroll.render());
+                    Lampa.Controller.collectionSet(scroll.render(), false, true);
+
+                    var target = last;
+                    if (target && (!target.length || !target[0] || target[0].offsetParent === null)) target = false;
+
+                    if (!target) {
+                        try { scroll.reset(); } catch (e) {}
+                    }
+
+                    Lampa.Controller.collectionFocus(target || false, scroll.render(), true);
                 },
                 up: function () {
                     if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
                 },
                 down: function () {
                     if (Navigator.canmove('down')) Navigator.move('down');
                 },
                 left: function () {
                     if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
                 },
                 right: function () {
                     if (Navigator.canmove('right')) Navigator.move('right');
@@ -2516,7 +2557,8 @@
                     Lampa.Activity.backward();
                 }
             });
-            Lampa.Controller.toggle(COMPONENT);
+
+            Lampa.Controller.toggle(NAV_CONTROLLER);
         };
 
         this.stop = function () {
